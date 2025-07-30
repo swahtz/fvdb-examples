@@ -9,7 +9,7 @@ import tqdm
 import tyro
 from sun_3d_dataset import Sun3dDataset
 
-from fvdb import JaggedTensor, gridbatch_from_dense
+from fvdb import Grid
 
 
 def reconstruct_mesh_from_depth_maps(
@@ -45,10 +45,10 @@ def reconstruct_mesh_from_depth_maps(
     dtype = torch.float16
     voxel_trunc_margin = 2.0
     trunc_margin = voxel_size * voxel_trunc_margin
-    accum_grid = gridbatch_from_dense(1, [1, 1, 1], voxel_sizes=voxel_size, device=device)
-    weights = JaggedTensor([torch.zeros(accum_grid.total_voxels, device=device, dtype=dtype)])
-    tsdf = JaggedTensor([torch.zeros(accum_grid.total_voxels, device=device, dtype=dtype)])
-    colors = JaggedTensor([torch.zeros(accum_grid.total_voxels, 3, device=device, dtype=color_dtype)])
+    accum_grid = Grid.from_dense(dense_dims=[1, 1, 1], voxel_size=voxel_size, device=device)
+    weights = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    colors = torch.zeros(accum_grid.num_voxels, 3, device=device, dtype=color_dtype)
 
     with tqdm.tqdm(dataloader, desc="Integrating depth maps", unit="frames") as pbar:
         # For each image and depth map in the dataset, get it's camera pose and integrate it into the grid.
@@ -65,37 +65,32 @@ def reconstruct_mesh_from_depth_maps(
                 continue
 
             accum_grid, tsdf, weights, colors = accum_grid.integrate_tsdf_with_features(
-                tsdf,
-                weights,
-                colors,
-                depth,
-                rgb,
-                projection_matrix,
-                cam_to_world_matrix,
-                trunc_margin,
+                truncation_distance=trunc_margin,
+                projection_matrix=projection_matrix,
+                cam_to_world_matrix=cam_to_world_matrix,
+                tsdf=tsdf,
+                features=colors,
+                weights=weights,
+                depth_image=depth,
+                feature_image=rgb,
             )
-            pbar.set_postfix({"accumulated_voxels": f"{accum_grid.total_voxels:,}"})
+            pbar.set_postfix({"accumulated_voxels": f"{accum_grid.num_voxels:,}"})
 
     # Prune any voxels from the grid with zero weights. These were added during integration but never updated.
     # Correspondingly prune their TSDF and color values.
-    logging.info(f"Done accumulating depth maps. Total accumulated voxels: {accum_grid.total_voxels:,}")
+    logging.info(f"Done accumulating depth maps. Total accumulated voxels: {accum_grid.num_voxels:,}")
     logging.info(f"Pruning zero-weight voxels from the accumulated grid.")
     new_grid = accum_grid.pruned_grid(weights > 0.0)
-    filter_tsdf = new_grid.jagged_like(torch.zeros(new_grid.total_voxels, device=new_grid.device, dtype=dtype))
-    filter_colors = new_grid.jagged_like(
-        torch.zeros(new_grid.total_voxels, 3, device=new_grid.device, dtype=torch.uint8)
-    )
+    filter_tsdf = torch.zeros(new_grid.num_voxels, device=new_grid.device, dtype=dtype)
+    filter_colors = torch.zeros(new_grid.num_voxels, 3, device=new_grid.device, dtype=torch.uint8)
     new_grid.inject_from(accum_grid, tsdf, filter_tsdf)
     new_grid.inject_from(accum_grid, colors, filter_colors)
-    logging.info(f"Done pruning grid. Total voxels after pruning: {new_grid.total_voxels:,}")
+    logging.info(f"Done pruning grid. Total voxels after pruning: {new_grid.num_voxels:,}")
 
     # Extract a mesh from the accumulated grid using marching cubes.
     logging.info(f"Extracting mesh from the accumulated grid using marching cubes.")
     vertices, faces, vertex_normals = new_grid.marching_cubes(filter_tsdf, 0.0)
-    vertices = vertices.jdata
-    faces = faces.jdata
-    vertex_normals = vertex_normals.jdata
-    colors = new_grid.sample_trilinear(vertices, filter_colors.to(dtype)).jdata / 255.0
+    colors = new_grid.sample_trilinear(vertices, filter_colors.to(dtype)) / 255.0
     colors.clip_(min=0.0, max=1.0)
     logging.info(f"Mesh extraction complete. Got {vertices.shape[0]:,} Vertices, and {faces.shape[0]:,} Faces.")
 
