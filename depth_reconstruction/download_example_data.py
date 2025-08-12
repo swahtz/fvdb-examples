@@ -27,9 +27,9 @@ def main():
 
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_zip_filename = "sun3d-mit_76_studyroom-76-1studyroom2.zip"
-    dataset_url = f"http://vision.princeton.edu/projects/2016/3DMatch/downloads/rgbd-datasets/{dataset_zip_filename}"
-    dataset_sha256 = "5af09bc9e47a116ec31bed7e4a8712383bdab9eadf683cb8938ffd6448a00ede"
+    dataset_zip_filename = "sun3d-mit_76_studyroom-76-1studyroom2.tar.gz"
+    dataset_url = f"https://huggingface.co/datasets/nvidia/nvblox/resolve/b00d02dc64cffa70c4202f5fc52d9c9d00ae5d80/{dataset_zip_filename}"
+    dataset_sha256 = "004c895c71480b1cad47a21ecb5f63cca3393c29facf09741eb66e324b6ddc33"
 
     download_path = data_dir / dataset_zip_filename
 
@@ -67,7 +67,7 @@ def main():
             return
 
     logging.info(f"Extracting {download_path} to {data_dir}")
-    shutil.unpack_archive(download_path, extract_dir=data_dir, format="zip")
+    shutil.unpack_archive(download_path, extract_dir=data_dir)
     logging.info(f"Extraction complete. Data available at {data_dir}")
 
 

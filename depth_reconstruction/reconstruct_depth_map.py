@@ -45,7 +45,7 @@ def reconstruct_mesh_from_depth_maps(
     dtype = torch.float16
     voxel_trunc_margin = 2.0
     trunc_margin = voxel_size * voxel_trunc_margin
-    accum_grid = Grid.from_dense(dense_dims=[1, 1, 1], voxel_size=voxel_size, device=device)
+    accum_grid = Grid.from_zero_voxels(device=device, voxel_size=voxel_size)
     weights = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
     tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
     colors = torch.zeros(accum_grid.num_voxels, 3, device=device, dtype=color_dtype)
@@ -54,10 +54,10 @@ def reconstruct_mesh_from_depth_maps(
         # For each image and depth map in the dataset, get it's camera pose and integrate it into the grid.
         # This returns a new grid and updated tsdf, weights, and colors tensors.
         for i, data in enumerate(pbar):
-            rgb = data["rgb"].to(device=device, dtype=torch.uint8)
-            depth = data["depth"].to(device=device, dtype=dtype)
-            cam_to_world_matrix = data["cam_to_world_matrix"].to(device=device, dtype=dtype)
-            projection_matrix = data["projection_matrix"].to(device=device, dtype=dtype)
+            rgb = data["rgb"].to(device=device, dtype=torch.uint8).squeeze(0)
+            depth = data["depth"].to(device=device, dtype=dtype).squeeze(0)
+            cam_to_world_matrix = data["cam_to_world_matrix"].to(device=device, dtype=dtype).squeeze(0)
+            projection_matrix = data["projection_matrix"].to(device=device, dtype=dtype).squeeze(0)
 
             cam_to_world_det = torch.linalg.det(cam_to_world_matrix.to(torch.float32))
             if cam_to_world_det < 1e-6 or cam_to_world_det.isnan().any() or cam_to_world_det.isinf().any():
