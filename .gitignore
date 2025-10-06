@@ -1,3 +1,5 @@
 data/
 results/
 sam2/checkpoints
+__pycache__
+*.egg-info
