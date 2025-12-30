@@ -2,216 +2,485 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 import logging
-import sys
+import pathlib
 import time
-from pathlib import Path
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Annotated, Optional
 
+import fvdb.viz as fviz
 import numpy as np
 import torch
-from garfvdb.dataset import SegmentationDataset
-from garfvdb.model import GARfVDBInput, GARfVDBModel
-from garfvdb.util import calculate_pca_projection, pca_projection_fast
-from viz import CameraState, Viewer
-
-np.set_printoptions(suppress=True)
 import tyro
-import viser
+from fvdb import GaussianSplat3d
+from fvdb.types import to_Mat33fBatch, to_Mat44fBatch, to_Vec2iBatch
+from tyro.conf import arg
+
+from garfvdb.model import GARfVDBModel
+from garfvdb.training.dataset import GARfVDBInput
+from garfvdb.training.segmentation import GaussianSplatScaleConditionedSegmentation
+from garfvdb.util import (
+    calculate_pca_projection,
+    load_splats_from_file,
+    pca_projection_fast,
+)
 
 
-def main(segmentation_dataset_path: Path, garfvdb_checkpoint_path: Path, gsplat_checkpoint_path: Path):
+def load_segmentation_runner_from_checkpoint(
+    checkpoint_path: pathlib.Path,
+    gs_model: GaussianSplat3d,
+    gs_model_path: pathlib.Path,
+    device: str | torch.device = "cuda",
+) -> GaussianSplatScaleConditionedSegmentation:
+    """
+    Load a GaussianSplatScaleConditionedSegmentation runner from a checkpoint file.
 
-    device = torch.device("cuda")
+    This loads the complete training state including the transformed SfmScene (with correct
+    scale statistics), the GARfVDB segmentation model, and the GaussianSplat3d model.
 
-    full_dataset = SegmentationDataset(segmentation_dataset_path)
-    grouping_scale_stats = torch.cat(full_dataset.scales)
+    Args:
+        checkpoint_path: Path to the segmentation checkpoint (.pt or .pth).
+        gs_model: GaussianSplat3d model.
+        gs_model_path: Path to the GaussianSplat3d model.
+        device: Device to load the model onto.
 
-    model = GARfVDBModel.create_from_checkpoint(garfvdb_checkpoint_path, gsplat_checkpoint_path, grouping_scale_stats)
+    Returns:
+        The loaded GaussianSplatScaleConditionedSegmentation runner with access to:
+        - runner.model: The GARfVDB segmentation model
+        - runner.gs_model: The GaussianSplat3d model
+        - runner.sfm_scene: The transformed SfmScene with correct scales
+        - runner.config: The training configuration
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    client_up_axis_dropdowns = {}
-    client_scale_sliders = {}
-    client_mask_blend_sliders = {}
-    client_freeze_pca_checkboxes = {}
-    frozen_pca_projection = None
+    runner = GaussianSplatScaleConditionedSegmentation.from_state_dict(
+        state_dict=checkpoint,
+        gs_model=gs_model,
+        gs_model_path=gs_model_path,
+        device=device,
+        eval_only=True,
+    )
 
-    freeze_pca = False
-    viewer_scale = 0.1
-    viewer_mask_blend = 0.5
-    current_up_axis = "+z"
+    torch.cuda.empty_cache()
+
+    return runner
+
+
+class SegmentationRenderer:
+    def __init__(
+        self,
+        gs_model: GaussianSplat3d,
+        segmentation_model: GARfVDBModel,
+        device: torch.device,
+    ):
+        """
+        Initialize the segmentation renderer.
+
+        Args:
+            gs_model: The GaussianSplat3d model for rendering beauty images.
+            segmentation_model: The trained GARfVDBModel for segmentation.
+            device: The torch device.
+        """
+        self.gs_model = gs_model
+        self.segmentation_model = segmentation_model
+        self.device = device
+
+        # Renderer state
+        self.scale = 0.1 * segmentation_model.max_scale
+        self.mask_blend = 0.5
+        self.freeze_pca = False
+        self.frozen_pca_projection: Optional[torch.Tensor] = None
+
+        self._logger = logging.getLogger(__name__)
 
     def _apply_pca_projection(
-        features: torch.Tensor, n_components: int = 3, valid_feature_mask: Optional[torch.Tensor] = None
+        self,
+        features: torch.Tensor,
+        n_components: int = 3,
+        valid_feature_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply PCA projection, either using frozen parameters or computing fresh ones."""
-        nonlocal frozen_pca_projection
-
-        if freeze_pca and frozen_pca_projection is not None:
+        if self.freeze_pca and self.frozen_pca_projection is not None:
             # Use frozen PCA projection matrix
-            return pca_projection_fast(features, n_components, V=frozen_pca_projection, mask=valid_feature_mask)
+            return pca_projection_fast(features, n_components, V=self.frozen_pca_projection, mask=valid_feature_mask)
         else:
             # Compute fresh PCA
             try:
                 result = pca_projection_fast(features, n_components, mask=valid_feature_mask)
 
                 # Store projection matrix if freezing is enabled
-                if freeze_pca:
+                if self.freeze_pca:
                     if valid_feature_mask is not None:
                         features = features[valid_feature_mask]
-                    frozen_pca_projection = calculate_pca_projection(features, n_components, center=True)
+                    self.frozen_pca_projection = calculate_pca_projection(features, n_components, center=True)
 
                 return result
             except RuntimeError as e:
                 if "failed to converge" in str(e):
                     # Fallback: return zeros with correct shape
-                    logging.warning("PCA failed to converge, returning zero projection")
+                    self._logger.warning("PCA failed to converge, returning zero projection")
                     B, H, W, C = features.shape
                     return torch.zeros(B, H, W, n_components, device=features.device, dtype=features.dtype)
                 else:
                     raise e
 
     @torch.no_grad()
-    def _viewer_render_fn(camera_state: CameraState, img_wh: Tuple[int, int]):
-        """Callable function for the viewer that renders a blend of the image and mask."""
-        img_w, img_h = img_wh
-        cam_to_world_matrix = camera_state.c2w
-        projection_matrix = camera_state.get_K(img_wh)
-        world_to_cam_matrix = torch.linalg.inv(torch.from_numpy(cam_to_world_matrix).float().to(device)).contiguous()
-        projection_matrix = torch.from_numpy(projection_matrix).float().to(device)
+    def render_segmentation_image(
+        self,
+        camera_to_world: torch.Tensor,
+        projection: torch.Tensor,
+        img_w: int,
+        img_h: int,
+    ) -> np.ndarray:
+        """
+        Render an RGBA segmentation image for use with fvdb.viz add_image API.
 
-        # Create a mock input for the model
-        mock_input = GARfVDBInput(
+        Args:
+            camera_to_world: Camera to world transformation matrix [4, 4].
+            projection: Projection matrix [3, 3].
+            img_w: Image width.
+            img_h: Image height.
+
+        Returns:
+            RGBA segmentation image as uint8 numpy array [H, W, 4].
+        """
+        # Create input for the model
+        model_input = GARfVDBInput(
             {
-                "intrinsics": projection_matrix.unsqueeze(0),
-                "cam_to_world": torch.from_numpy(cam_to_world_matrix).float().to(device).unsqueeze(0),
-                "image_w": torch.tensor([img_w]).to(device),
-                "image_h": torch.tensor([img_h]).to(device),
+                "projection": projection.unsqueeze(0),
+                "camera_to_world": camera_to_world.unsqueeze(0),
+                "image_w": torch.tensor([img_w]).to(self.device),
+                "image_h": torch.tensor([img_h]).to(self.device),
             }
         )
 
         try:
-            # Render the beauty image
-            beauty_colors, _ = model.gs_model.render_images(
-                world_to_cam_matrix[None],
-                projection_matrix[None],
-                img_w,
-                img_h,
-                0.01,
-                1e10,
-                "perspective",
-                # 0,  # sh_degree_to_use
-            )
-            beauty_rgb = beauty_colors[0, ..., :3]
-
             # Render the mask features
-            mask_features_output, mask_alpha = model.get_mask_output(mock_input, viewer_scale)
+            mask_features_output, mask_alpha = self.segmentation_model.get_mask_output(model_input, self.scale)
 
             # Apply PCA projection
-            mask_pca = _apply_pca_projection(mask_features_output, 3, valid_feature_mask=mask_alpha.squeeze(-1) > 0)[0]
+            mask_pca = self._apply_pca_projection(
+                mask_features_output, 3, valid_feature_mask=mask_alpha.squeeze(-1) > 0
+            )[0]
 
-            # Blend between beauty image and mask based on slider value
-            alpha = viewer_mask_blend
-            blended_rgb = beauty_rgb * (1 - alpha) + mask_pca * alpha
+            # Blend mask output based on blend factor
+            mask_alpha *= self.mask_blend
 
-            return np.clip(blended_rgb.cpu().numpy(), 0.0, 1.0)
+            rgba = np.concatenate([mask_pca.cpu().numpy(), mask_alpha[0].cpu().numpy()], axis=-1)
 
         except Exception as e:
-            logging.warning(f"Error in viewer render function: {e}")
+            self._logger.warning(f"Error in render function: {e}")
+            import traceback
+
+            traceback.print_exc()
             # Return a fallback image on error
-            return np.zeros((img_h, img_w, 3), dtype=np.float32)
+            rgba = np.zeros((img_h, img_w, 4), dtype=np.float32)
 
-    server = viser.ViserServer(port=8080, verbose=False)
-    server.scene.set_up_direction(current_up_axis)
+        return (rgba.clip(0.0, 1.0) * 255).astype(np.uint8)
 
-    @server.on_client_connect
-    def _(client: viser.ClientHandle) -> None:
-        # up axis dropdown
-        up_axis_dropdown = client.gui.add_dropdown(
-            "Up Axis",
-            options=["+x", "-x", "+y", "-y", "+z", "-z"],
-            initial_value=current_up_axis,
+
+@dataclass
+class ViewCheckpoint:
+    """
+    Interactive viewer for GARfVDB segmentation models.
+
+    This command starts an interactive 3D viewer that displays the Gaussian splat
+    radiance field with a live segmentation mask overlay that updates as you
+    move the camera.
+
+    Example usage:
+
+        # View a trained segmentation model (loads SfM scene and GS model from checkpoint)
+        python view_checkpoint.py --segmentation-path ./segmentation_checkpoint.pt
+
+        # View with explicit paths (overrides checkpoint paths)
+        python view_checkpoint.py --segmentation-path ./segmentation_checkpoint.pt \\
+            --reconstruction-path ./gsplat_checkpoint.ply
+
+    """
+
+    # Path to the GarfVDB segmentation checkpoint (.pt or .pth)
+    # This checkpoint contains the transformed SfmScene and reference to the GS model
+    segmentation_path: Annotated[pathlib.Path, arg(aliases=["-s"])]
+
+    # Optional: Path to the Gaussian splat reconstruction checkpoint (overrides checkpoint path)
+    reconstruction_path: Annotated[pathlib.Path, arg(aliases=["-r"])]
+
+    # The port to expose the viewer server on
+    viewer_port: Annotated[int, arg(aliases=["-p"])] = 8080
+
+    # The IP address to expose the viewer server on
+    viewer_ip_address: Annotated[str, arg(aliases=["-ip"])] = "127.0.0.1"
+
+    # If True, then the viewer will log verbosely
+    verbose: Annotated[bool, arg(aliases=["-v"])] = False
+
+    # Device to use for computation
+    device: str | torch.device = "cuda"
+
+    # Initial segmentation scale (fraction of max scale)
+    initial_scale: float = 0.1
+
+    # Initial mask blend factor (0 = beauty only, 1 = mask only)
+    initial_blend: float = 0.5
+
+    # How often to check for camera changes (seconds)
+    camera_check_interval: float = 0.5
+
+    # Disable the segmentation overlay (just show Gaussian splats)
+    no_overlay: bool = False
+
+    def execute(self) -> None:
+        """Execute the viewer command."""
+        log_level = logging.DEBUG if self.verbose else logging.INFO
+        logging.basicConfig(level=log_level, format="%(levelname)s : %(message)s")
+        logger = logging.getLogger(__name__)
+
+        device = torch.device(self.device)
+
+        # Validate segmentation checkpoint path
+        if not self.segmentation_path.exists():
+            raise FileNotFoundError(f"Segmentation checkpoint {self.segmentation_path} does not exist.")
+
+        # Load GS model from explicit path
+        if not self.reconstruction_path.exists():
+            raise FileNotFoundError(f"Reconstruction checkpoint {self.reconstruction_path} does not exist.")
+        logger.info(f"Loading Gaussian splat model from {self.reconstruction_path}")
+        gs_model, metadata = load_splats_from_file(self.reconstruction_path, device)
+        logger.info(f"Loaded {gs_model.num_gaussians:,} Gaussians")
+
+        # Load the segmentation runner from checkpoint
+        # This restores the trained model, the GS model, and the transformed SfmScene with correct scales
+        logger.info(f"Loading segmentation checkpoint from {self.segmentation_path}")
+        runner = load_segmentation_runner_from_checkpoint(
+            checkpoint_path=self.segmentation_path,
+            gs_model=gs_model,
+            gs_model_path=self.reconstruction_path,
+            device=device,
         )
 
-        # scale slider
-        scale_slider = client.gui.add_slider(
-            "Scale",
-            min=0.0,
-            max=model.max_scale,
-            step=0.01,
-            initial_value=viewer_scale,
+        # Get models and scene from the runner
+        gs_model = runner.gs_model
+        segmentation_model = runner.model
+        sfm_scene = runner.sfm_scene
+
+        logger.info(f"Loaded {gs_model.num_gaussians:,} Gaussians")
+        logger.info(f"Restored SfmScene with {sfm_scene.num_images} images (with correct scale transforms)")
+        logger.info(f"Segmentation model max scale: {segmentation_model.max_scale:.4f}")
+
+        # Create the renderer
+        renderer = SegmentationRenderer(
+            gs_model=gs_model,
+            segmentation_model=segmentation_model,
+            device=device,
+        )
+        renderer.scale = self.initial_scale * segmentation_model.max_scale
+        renderer.mask_blend = self.initial_blend
+
+        # Initialize fvdb.viz
+        logger.info(f"Starting viewer server on {self.viewer_ip_address}:{self.viewer_port}")
+        fviz.init(ip_address=self.viewer_ip_address, port=self.viewer_port, verbose=self.verbose)
+        viz_scene = fviz.get_scene("GarfVDB Segmentation Viewer")
+
+        # Set initial camera position
+        scene_centroid = gs_model.means.mean(dim=0).cpu().numpy()
+        cam_to_world_matrices = metadata.get("camera_to_world_matrices", None)
+        if cam_to_world_matrices is not None:
+            cam_to_world_matrices = to_Mat44fBatch(cam_to_world_matrices.detach()).cpu()
+            initial_camera_position = cam_to_world_matrices[0, :3, 3].numpy()
+        else:
+            scene_radius = (gs_model.means.max(dim=0).values - gs_model.means.min(dim=0).values).max().item() / 2.0
+            initial_camera_position = scene_centroid + np.ones(3) * scene_radius
+
+        logger.info(f"Setting camera to {initial_camera_position} looking at {scene_centroid}")
+        viz_scene.set_camera_lookat(
+            eye=initial_camera_position,
+            center=scene_centroid,
+            up=[0, 0, 1],
         )
 
-        # mask blend slider
-        mask_blend_slider = client.gui.add_slider(
-            "Mask Blend",
-            min=0.0,
-            max=1.0,
-            step=0.01,
-            initial_value=viewer_mask_blend,
-        )
+        # Add cameras to the scene if available
+        projection_matrices = metadata.get("projection_matrices", None)
+        image_sizes = metadata.get("image_sizes", None)
+        if cam_to_world_matrices is not None and projection_matrices is not None:
+            projection_matrices = to_Mat33fBatch(projection_matrices.detach()).cpu()
+            if image_sizes is not None:
+                image_sizes = to_Vec2iBatch(image_sizes.detach()).cpu()
+            viz_scene.add_cameras(
+                name="Training Cameras",
+                camera_to_world_matrices=cam_to_world_matrices,
+                projection_matrices=projection_matrices,
+                image_sizes=image_sizes,
+            )
 
-        # freeze PCA checkbox
-        freeze_pca_checkbox = client.gui.add_checkbox(
-            "Freeze PCA Projection",
-            initial_value=freeze_pca,
-        )
+        # Get overlay dimensions from training image sizes (use first camera's size)
+        assert image_sizes is not None
+        overlay_width = int(image_sizes[0, 0].item())
+        overlay_height = int(image_sizes[0, 1].item())
+        logger.info(f"Using training image size for overlay: {overlay_width}x{overlay_height}")
 
-        client_up_axis_dropdowns[client.client_id] = up_axis_dropdown
-        client_scale_sliders[client.client_id] = scale_slider
-        client_mask_blend_sliders[client.client_id] = mask_blend_slider
-        client_freeze_pca_checkboxes[client.client_id] = freeze_pca_checkbox
+        # Add the Gaussian splat model to the scene
+        viz_scene.add_gaussian_splat_3d("Gaussian Splats", gs_model)
 
-        # Add callback for up axis changes
-        @up_axis_dropdown.on_update
-        def _on_up_axis_change(event) -> None:
-            viewer.set_up_axis(client.client_id, event.target.value)
+        # Set up the segmentation overlay if enabled
+        image_view = None
+        if not self.no_overlay:
+            try:
+                # Create an initial blank image
+                initial_image = np.zeros((overlay_height, overlay_width, 4), dtype=np.uint8)
+                initial_image[..., 3] = 128  # Semi-transparent
 
-        # Add callback for scale changes
-        @scale_slider.on_update
-        def _on_scale_change(event) -> None:
-            nonlocal viewer_scale
-            viewer_scale = event.target.value
-            # Trigger re-render when scale changes
-            viewer.rerender(None)
+                # Add the image overlay using the add_image API
+                image_view = viz_scene.add_image(  # type: ignore[call-arg]
+                    name="Segmentation Overlay",
+                    width=overlay_width,
+                    height=overlay_height,
+                    rgba_image=initial_image.flatten(),
+                )
+                logger.info("Segmentation overlay enabled")
 
-        # Add callback for mask blend changes
-        @mask_blend_slider.on_update
-        def _on_mask_blend_change(event) -> None:
-            nonlocal viewer_mask_blend
-            viewer_mask_blend = event.target.value
-            # Trigger re-render when mask blend changes
-            viewer.rerender(None)
+            except AttributeError as e:
+                logger.warning(f"add_image API not available: {e}")
+                logger.info("Running without segmentation overlay")
+            except Exception as e:
+                logger.warning(f"Failed to set up segmentation overlay: {e}")
+                logger.info("Running without segmentation overlay")
 
-        # Add callback for freeze PCA checkbox
-        @freeze_pca_checkbox.on_update
-        def _on_freeze_pca_change(event) -> None:
-            nonlocal freeze_pca, frozen_pca_projection
-            freeze_pca = event.target.value
-            if not freeze_pca:
-                # Clear frozen PCA parameters when unfreezing
-                frozen_pca_projection = None
-            # Trigger re-render when freeze state changes
-            viewer.rerender(None)
+        logger.info("=" * 60)
+        logger.info("Viewer running... Ctrl+C to exit.")
+        logger.info(f"Open your browser to http://{self.viewer_ip_address}:{self.viewer_port}")
+        logger.info("")
+        logger.info("Segmentation settings:")
+        logger.info(f"  - Scale: {renderer.scale:.4f} (max: {segmentation_model.max_scale:.4f})")
+        logger.info(f"  - Mask blend: {renderer.mask_blend:.2f}")
+        if image_view is not None:
+            logger.info(f"  - Overlay resolution: {overlay_width}x{overlay_height}")
+            logger.info(f"  - Update interval: {self.camera_check_interval}s")
+        else:
+            logger.info("  - Overlay: DISABLED")
+        logger.info("=" * 60)
 
-    # Add client disconnect handler to clean up
-    @server.on_client_disconnect
-    def _(client: viser.ClientHandle) -> None:
-        if client.client_id in client_up_axis_dropdowns:
-            del client_up_axis_dropdowns[client.client_id]
-        if client.client_id in client_scale_sliders:
-            del client_scale_sliders[client.client_id]
-        if client.client_id in client_mask_blend_sliders:
-            del client_mask_blend_sliders[client.client_id]
-        if client.client_id in client_freeze_pca_checkboxes:
-            del client_freeze_pca_checkboxes[client.client_id]
+        fviz.show()
 
-    viewer = Viewer(
-        server=server,
-        render_fn=_viewer_render_fn,
-        mode="rendering",
-    )
-    print("Viewer running... Ctrl+C to exit.")
-    time.sleep(1000000)
+        # Simple loop to check camera changes and update overlay
+        prev_center = None
+        prev_direction = None
+        prev_radius = None
+        prev_up = None
+
+        def camera_changed() -> bool:
+            """Check if camera state changed using documented fvdb.viz.Scene properties."""
+            nonlocal prev_center, prev_direction, prev_radius, prev_up
+            try:
+                center = viz_scene.camera_orbit_center
+                direction = viz_scene.camera_orbit_direction
+                radius = viz_scene.camera_orbit_radius
+                up = viz_scene.camera_up_direction
+
+                # First time - always update
+                if prev_center is None:
+                    prev_center = center
+                    prev_direction = direction
+                    prev_radius = radius
+                    prev_up = up
+                    return True
+
+                assert prev_center is not None and prev_direction is not None and prev_up is not None
+                changed = (
+                    not np.allclose(center, prev_center)
+                    or not np.allclose(direction, prev_direction)
+                    or radius != prev_radius
+                    or not np.allclose(up, prev_up)
+                )
+
+                if changed:
+                    prev_center = center
+                    prev_direction = direction
+                    prev_radius = radius
+                    prev_up = up
+
+                return changed
+            except Exception:
+                return False
+
+        # Get reference projection from SfmScene (for correct intrinsics)
+        sfm_projection = torch.from_numpy(sfm_scene.projection_matrices).float().to(device)
+        reference_projection = sfm_projection[0]
+
+        # OpenGL to OpenCV conversion matrix (applied to camera axes)
+        # OpenGL: X-right, Y-up, Z-backward
+        # OpenCV: X-right, Y-down, Z-forward
+        opengl_to_opencv = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+
+        def update_overlay() -> None:
+            """Render and update the segmentation overlay."""
+            if image_view is None:
+                return
+            try:
+                # Get orbit camera state from viewer
+                # NOTE: Despite the Python API name "camera_orbit_direction", the C++ implementation
+                # returns eye_direction which is the direction the camera is LOOKING (toward scene).
+                # Camera position = center - eye_direction * distance (see Camera.h line 387-390)
+                center = np.array(viz_scene.camera_orbit_center.cpu().numpy())
+                eye_direction = np.array(viz_scene.camera_orbit_direction.cpu().numpy())
+                radius = viz_scene.camera_orbit_radius
+                up_world = np.array(viz_scene.camera_up_direction.cpu().numpy())
+
+                # Camera position: center - eye_direction * radius
+                # (eye_direction points FROM camera TOWARD center)
+                position = center - eye_direction * radius
+
+                # Forward = eye_direction (already the look direction)
+                forward = eye_direction / np.linalg.norm(eye_direction)
+
+                # Right vector = forward × up_world
+                right = np.cross(forward, up_world)
+                right = right / np.linalg.norm(right)
+
+                # Up vector = right × forward
+                up = np.cross(right, forward)
+                up = up / np.linalg.norm(up)
+
+                # Build OpenGL-style camera-to-world (X-right, Y-up, Z-backward)
+                # In OpenGL, camera looks along -Z, so Z column = -forward
+                c2w_opengl = np.eye(4, dtype=np.float32)
+                c2w_opengl[:3, 0] = right
+                c2w_opengl[:3, 1] = up
+                c2w_opengl[:3, 2] = -forward  # OpenGL: camera looks along -Z
+                c2w_opengl[:3, 3] = position
+
+                # Convert to OpenCV convention for the segmentation model
+                c2w_opencv = c2w_opengl @ opengl_to_opencv
+
+                camera_to_world = torch.from_numpy(c2w_opencv).float().to(renderer.device)
+
+                rgba_image = renderer.render_segmentation_image(
+                    camera_to_world, reference_projection, overlay_width, overlay_height
+                )
+                image_view.update(rgba_image.flatten())  # type: ignore[attr-defined]
+                logger.debug(f"Updated segmentation overlay ({overlay_width}x{overlay_height})")
+            except Exception as e:
+                logger.warning(f"Error updating overlay: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+        try:
+            while True:
+                time.sleep(self.camera_check_interval)
+
+                if image_view is not None and camera_changed():
+                    logger.debug("Camera changed, updating overlay...")
+                    update_overlay()
+
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+
+
+def main():
+    """Main entry point."""
+    cmd = tyro.cli(ViewCheckpoint)
+    cmd.execute()
 
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    main()

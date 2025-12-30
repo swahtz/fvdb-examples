@@ -6,11 +6,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import tyro
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
 from garfvdb.dataset import SegmentationDataset
 from garfvdb.model import GARfVDBModel
 from garfvdb.util import pca_projection_fast
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 
 def main(gs_checkpoint_path: str, garfvdb_checkpoint_path: str, segmentation_dataset_path: str):
@@ -44,8 +45,8 @@ def main(gs_checkpoint_path: str, garfvdb_checkpoint_path: str, segmentation_dat
             sample[k] = v.to(device)
 
         image = sample["image"]
-        intrinsics = sample["intrinsics"]
-        cam_to_world = sample["cam_to_world"]
+        intrinsics = sample["projection"]
+        cam_to_world = sample["camera_to_world"]
         h, w = sample["image_h"][0], sample["image_w"][0]
 
         with torch.no_grad():

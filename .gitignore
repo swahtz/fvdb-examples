@@ -3,3 +3,8 @@ results/
 sam2/checkpoints
 __pycache__
 *.egg-info
+
+**/garfvdb_logs/
+**/frgs_logs/
+**/fvdb_gslogs
+**/logs/

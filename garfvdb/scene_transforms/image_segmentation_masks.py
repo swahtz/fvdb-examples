@@ -1,3 +1,6 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+#
 import argparse
 import hashlib
 import logging
@@ -9,8 +12,8 @@ import numpy as np
 import torch
 import tqdm
 from fvdb import GaussianSplat3d
-from fvdb_reality_capture import SfmCache, SfmScene
 from fvdb_reality_capture.foundation_models import SAM2Model
+from fvdb_reality_capture.sfm_scene import SfmCache, SfmScene
 from fvdb_reality_capture.transforms import BaseTransform, transform
 
 
@@ -24,6 +27,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
 
     def __init__(
         self,
+        gs3d: GaussianSplat3d,
         checkpoint: Literal["large", "small", "tiny", "base_plus"] = "large",
         points_per_side=40,
         pred_iou_thresh=0.80,
@@ -40,6 +44,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
             device (torch.device | str): The device to use for the SAM2 model.
         """
         self._checkpoint = checkpoint
+        self._gs3d = gs3d
         self._image_type = "pt"
         self._points_per_side = points_per_side
         self._pred_iou_thresh = pred_iou_thresh
@@ -59,14 +64,12 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
     def __call__(
         self,
         input_scene: SfmScene,
-        gs3d: GaussianSplat3d,
     ) -> SfmScene:
         """
         Perform the compute image segmentation masks transform on the input scene and cache.
 
         Args:
             input_scene (SfmScene): The input scene containing images to be used to compute segmentation masks.
-            gs3d (GaussianSplat3d): The GaussianSplat3d object containing a trained 3D model.
 
         Returns:
             output_scene (SfmScene): A new SfmScene with paths to computed segmentation masks.
@@ -84,7 +87,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
 
         # hash of the transform parameters
         # TODO: In PyTorch 2.9 we can use torch.hash_tensor instead
-        hash_str = hashlib.sha256(gs3d.means.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+        hash_str = hashlib.sha256(self._gs3d.means.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
 
         cache_prefix = f"segmentation_masks_scales_{hash_str}_p{self._points_per_side}_i{int(self._pred_iou_thresh * 100)}_s{int(self._stability_score_thresh * 100)}"
         output_cache = input_cache.make_folder(
@@ -152,8 +155,8 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
                 break
 
         if regenerate_cache:
-            min = gs3d.means.min(dim=0)[0]
-            max = gs3d.means.max(dim=0)[0]
+            min = self._gs3d.means.min(dim=0)[0]
+            max = self._gs3d.means.max(dim=0)[0]
             gs3d_extents = torch.abs(max - min)
             max_scale = gs3d_extents.max().item()
 
@@ -166,7 +169,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
                 assert img is not None, f"Failed to load image {image_path}"
 
                 scales, pixel_to_mask_id, mask_cdf = self._generate_segmentation_mask(
-                    gs3d,
+                    self._gs3d,
                     img,
                     image_meta.camera_metadata.projection_matrix,
                     image_meta.world_to_camera_matrix,
@@ -177,7 +180,11 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
                 cache_image_filename = f"masks_{image_meta.image_id:0{num_zeropad}}"
                 cache_file_meta = output_cache.write_file(
                     name=cache_image_filename,
-                    data={"scales": scales, "pixel_to_mask_id": pixel_to_mask_id, "mask_cdf": mask_cdf},
+                    data={
+                        "scales": scales.detach().cpu(),
+                        "pixel_to_mask_id": pixel_to_mask_id.detach().cpu(),
+                        "mask_cdf": mask_cdf.detach().cpu(),
+                    },
                     data_type=self._image_type,
                     metadata={
                         "points_per_side": self._points_per_side,
@@ -228,11 +235,12 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
             mask_cdf: Mask CDF for the segmentation masks.
         """
         img = img.squeeze()  # [H, W, 3]
+        h, w = img.shape[:2]
         intrinsics = torch.from_numpy(projection_matrix).to(self._device).squeeze()
         world_to_cam = torch.from_numpy(world_to_camera_matrix).to(self._device).squeeze()
 
-        g_ids, _ = gs3d.render_top_contributing_gaussian_ids(
-            num_samples=1,
+        g_ids, _ = gs3d.render_contributing_gaussian_ids(
+            top_k_contributors=1,
             world_to_camera_matrices=world_to_cam.unsqueeze(0).float(),
             projection_matrices=intrinsics.unsqueeze(0).float(),
             image_width=img.shape[1],
@@ -240,7 +248,7 @@ class ComputeImageSegmentationMasksWithScales(BaseTransform):
             near=0.01,
             far=1e10,
         )
-        g_ids = g_ids.squeeze().unsqueeze(-1)  # [H, W, 1]
+        g_ids = g_ids.jdata.squeeze().reshape(h, w, 1)  # [H, W, 1]
 
         self._logger.debug("g_ids.shape " + str(g_ids.shape))
         if g_ids.max() >= gs3d.means.shape[0]:
@@ -397,10 +405,11 @@ if __name__ == "__main__":
     parser.add_argument("--gs_checkpoint_path", type=pathlib.Path, required=True)
     args = parser.parse_args()
 
-    segmentation_masks_transform = ComputeImageSegmentationMasksWithScales()
     scene = SfmScene.from_colmap(args.dataset_path)
     if args.gs_checkpoint_path.suffix == ".ply":
         gs3d, _ = GaussianSplat3d.from_ply(args.gs_checkpoint_path)
     else:
         gs3d = GaussianSplat3d.from_state_dict(torch.load(args.gs_checkpoint_path))
-    output_scene = segmentation_masks_transform(scene, gs3d)
+    segmentation_masks_transform = ComputeImageSegmentationMasksWithScales(gs3d)
+
+    output_scene = segmentation_masks_transform(scene)

@@ -1,13 +1,17 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
+from __future__ import annotations
+
 import logging
 import math
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
 
 import torch
-from garfvdb.model import GARfVDBModel
 from torch.nn import functional as F
+
+if TYPE_CHECKING:
+    from garfvdb.model import GARfVDBModel
 
 
 def chunked_norm(features_flat, mask_0, mask_1, chunk_size=10000) -> torch.Tensor:
@@ -71,7 +75,7 @@ def calculate_loss(
             containing the feature representations for each point/pixel.
         input (Dict[str, torch.Tensor]): Input dictionary containing:
             - "image": Input images of shape [B, H, W, C] or [B, num_samples, C]
-            - "mask_id": Instance mask IDs of shape matching image spatial dims, where
+            - "mask_ids": Instance mask IDs of shape matching image spatial dims, where
                         each unique ID represents a different instance (-1 for invalid/background)
             - "scales": Scale values for hierarchical feature computation
         return_loss_images (bool, optional): Whether to compute and return loss visualization
@@ -104,7 +108,7 @@ def calculate_loss(
         - Uses block masking to prevent cross-image comparisons in batched inputs
         - Only considers upper triangular pairs to avoid double-counting
         - Excludes diagonal pairs (same point with itself) from grouping supervision
-        - Filters out invalid pairs where mask_id == -1
+        - Filters out invalid pairs where mask_ids == -1
         - Loss visualization images are computed by scattering loss values back to
           their corresponding spatial locations in the input image
         - Normalizes final loss by the total number of valid pairs considered
@@ -117,11 +121,11 @@ def calculate_loss(
 
     num_chunks = enc_feats.shape[0]
 
-    input_id1 = input_id2 = input["mask_id"].flatten()
+    input_id1 = input_id2 = input["mask_ids"].flatten()
 
     # Debug prints
     logging.debug(
-        f"calc_loss shapes: enc_feats={enc_feats.shape}, input_id1={input_id1.shape}, mask_id={input['mask_id'].shape}"
+        f"calc_loss shapes: enc_feats={enc_feats.shape}, input_id1={input_id1.shape}, mask_ids={input['mask_ids'].shape}"
     )
 
     # Expand labels

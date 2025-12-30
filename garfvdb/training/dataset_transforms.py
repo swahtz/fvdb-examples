@@ -1,88 +1,42 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-import logging
 import random
-from pathlib import Path
-from typing import Dict, List, NotRequired, TypedDict, Union, cast
+from typing import cast
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 
-import fvdb
+from garfvdb.training.dataset import SegmentationDataItem, SegmentationDataset
 
 
-class SegmentationDataItem(TypedDict):
-    """Type definition for a single item in the SegmentationDataset for linting convenience."""
-
-    image: torch.Tensor  # [H, W, 3] or [num_samples, 3]
-    intrinsics: torch.Tensor  # [3, 3]
-    cam_to_world: torch.Tensor  # [4, 4]
-    scales: torch.Tensor  # [NM]
-    mask_cdf: torch.Tensor  # [H, W, MM] or [num_samples, MM]
-    mask_ids: torch.Tensor  # [H, W, MM] or [num_samples, MM]
-    image_h: torch.Tensor  # [1]
-    image_w: torch.Tensor  # [1]
-    image_full: NotRequired[torch.Tensor]  # [H, W, 3]
-    pixel_coords: NotRequired[torch.Tensor]  # [num_samples, 2]
-
-
-class SegmentationDataset(Dataset):
-    """Dataset for loading the SegmentationDataset which loads the images, intrinsics, cam_to_worlds,
-    scales, mask_cdfs, mask_ids from disk.  Members of this class can then be modified by further
-    data transforms."""
-
-    def __init__(self, segmentation_dataset_path: Union[str, Path]):
-        """
-        Args:
-            segmentation_dataset_path: Path to the segmentation dataset.
-        """
-        logging.info(f"Loading segmentation dataset from {segmentation_dataset_path}")
-        data = torch.load(segmentation_dataset_path)
-
-        # NM = num_masks, MM=max_masks
-        self.images = data["images"]  # List([H, W, 3])
-        self.intrinsics = data["intrinsics"]  # List([3, 3])
-        self.cam_to_worlds = data["cam_to_worlds"]  # List([4, 4])
-        self.scales = data["scales"]  # List( [NM] )  i.e. [0.6053, 0.4358, 0.2108, 0.2107, 0.2090, 0.1880, 0.1320,
-        self.mask_cdfs = data["mask_cdfs"]  # List([H, W, MM]) Float32 i.e. [0.5014, 1., 1., 1.]
-        self.mask_ids = data["mask_ids"]  # List([H, W, MM]) i.e. [12, 14, -1, -1],
-        self.image_h, self.image_w = self.images[0].shape[0], self.images[0].shape[1]
-
-    def __len__(self) -> int:
-        return len(self.images)
-
-    def __getitem__(self, idx: int) -> SegmentationDataItem:
-        return SegmentationDataItem(
-            image=self.images[idx],
-            intrinsics=self.intrinsics[idx],
-            cam_to_world=self.cam_to_worlds[idx],
-            scales=self.scales[idx],
-            mask_cdf=self.mask_cdfs[idx],
-            mask_ids=self.mask_ids[idx],
-            image_h=torch.tensor(self.images[idx].shape[0], dtype=torch.int32),
-            image_w=torch.tensor(self.images[idx].shape[1], dtype=torch.int32),
-        )
-
-
-class TransformDataset(Dataset):
+class TransformedSegmentationDataset(Dataset):
     """A dataset that applies transforms to the base dataset."""
 
-    def __init__(self, base_dataset, transform=None):
-        self.base_dataset = base_dataset
-        self.transform = transform
+    def __init__(self, base_dataset: SegmentationDataset, transform=None):
+        self._base_dataset = base_dataset
+        self._transform = transform
 
     def __getitem__(self, idx):
-        item = self.base_dataset[idx]
-        if self.transform:
-            return self.transform(item)
+        item = self._base_dataset[idx]
+        if self._transform:
+            return self._transform(item)
         return item
 
     def __len__(self):
-        return len(self.base_dataset)
+        return len(self._base_dataset)
+
+    @property
+    def base_dataset(self) -> SegmentationDataset:
+        return self._base_dataset
+
+    @property
+    def indices(self) -> np.ndarray:
+        return self._base_dataset.indices
 
 
 class RandomSelectMaskIDAndScale:
@@ -134,8 +88,8 @@ class RandomSelectMaskIDAndScale:
             if (random_index == j).sum() == 0:
                 continue
             curr_scale[random_index == j] = (
-                scales[per_pixel_mask_][random_index == j]
-                + (scales[per_pixel_mask][random_index == j] - scales[per_pixel_mask_][random_index == j])
+                scales[per_pixel_mask_][random_index == j]  # type: ignore
+                + (scales[per_pixel_mask][random_index == j] - scales[per_pixel_mask_][random_index == j])  # type: ignore
                 * random_vec_densify[random_index == j]
             ).squeeze()
 
@@ -281,54 +235,14 @@ class Resize:
         )
 
         # scale intrinsics for new image size
-        fx = item["intrinsics"][0, 0]
-        fy = item["intrinsics"][1, 1]
-        cx = item["intrinsics"][0, 2]
-        cy = item["intrinsics"][1, 2]
+        fx = item["projection"][0, 0]
+        fy = item["projection"][1, 1]
+        cx = item["projection"][0, 2]
+        cy = item["projection"][1, 2]
         new_fx = fx / self.scale
         new_fy = fy / self.scale
         new_cx = cx / self.scale
         new_cy = cy / self.scale
-        item["intrinsics"] = torch.tensor([[new_fx, 0, new_cx], [0, new_fy, new_cy], [0, 0, 1]], dtype=torch.float32)
+        item["projection"] = torch.tensor([[new_fx, 0, new_cx], [0, new_fy, new_cy], [0, 0, 1]], dtype=torch.float32)
 
         return item
-
-
-class GARfVDBInput(Dict[str, Union[torch.Tensor, fvdb.JaggedTensor, None]]):
-    """Dictionary with custom behavior for 3D Gaussian splatting inputs."""
-
-    def __repr__(self):
-        return f"GARfVDBInput({super().__repr__()})"
-
-    def to(self, device: torch.device) -> "GARfVDBInput":
-        return GARfVDBInput(
-            {k: v.to(device) if (type(v) in (torch.Tensor, fvdb.JaggedTensor)) else v for k, v in self.items()}
-        )
-
-
-def GARfVDBInputCollateFn(batch: List[SegmentationDataItem]) -> GARfVDBInput:
-    """Collate function for a DataLoader to stack the SegmentationDataItems into a GARfVDBInput.
-    Args:
-        batch: List of SegmentationDataItems.
-    Returns:
-        GARfVDBInput: A dictionary of tensors that is expected as input to the GARfVDB model.
-    """
-
-    kwargs = {
-        "image": torch.stack([cast(torch.Tensor, b["image"]) for b in batch]),
-        "intrinsics": torch.stack([cast(torch.Tensor, b["intrinsics"]) for b in batch]),
-        "cam_to_world": torch.stack([cast(torch.Tensor, b["cam_to_world"]) for b in batch]),
-        "image_h": torch.tensor([cast(int, b["image_h"]) for b in batch]),
-        "image_w": torch.tensor([cast(int, b["image_w"]) for b in batch]),
-        "scales": torch.stack([cast(torch.Tensor, b["scales"]) for b in batch]),
-        "mask_cdf": torch.nested.nested_tensor([cast(torch.Tensor, b["mask_cdf"]) for b in batch]),
-        "mask_id": torch.stack([cast(torch.Tensor, b["mask_ids"]) for b in batch]),
-    }
-
-    if "image_full" in batch[0]:
-        kwargs["image_full"] = torch.stack([cast(torch.Tensor, b.get("image_full")) for b in batch])
-
-    if "pixel_coords" in batch[0]:
-        kwargs["pixel_coords"] = torch.stack([cast(torch.Tensor, b.get("pixel_coords")) for b in batch])
-
-    return GARfVDBInput(**kwargs)
