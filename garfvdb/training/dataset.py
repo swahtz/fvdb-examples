@@ -2,7 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-from typing import Dict, List, NotRequired, Sequence, Sized, TypedDict, Union, cast
+from typing import (
+    List,
+    Literal,
+    NotRequired,
+    Sequence,
+    Sized,
+    TypedDict,
+    cast,
+    overload,
+)
 
 import fvdb
 import numpy as np
@@ -207,19 +216,43 @@ class InfiniteSampler(torch.utils.data.Sampler):
         )
 
 
-class GARfVDBInput(Dict[str, Union[torch.Tensor, fvdb.JaggedTensor, list[int], None]]):
-    """Dictionary with custom behavior for 3D Gaussian splatting inputs."""
+class GARfVDBInput(dict[str, torch.Tensor | fvdb.JaggedTensor | list[int] | None]):
+    @overload
+    def __getitem__(self, key: Literal["image_w"]) -> list[int]: ...
+    @overload
+    def __getitem__(self, key: Literal["image_h"]) -> list[int]: ...
+    @overload
+    def __getitem__(
+        self, key: Literal["image", "projection", "camera_to_world", "world_to_camera", "scales", "mask_ids"]
+    ) -> torch.Tensor: ...
+    @overload
+    def __getitem__(self, key: Literal["pixel_coords"]) -> torch.Tensor: ...
+    @overload
+    def __getitem__(self, key: str) -> torch.Tensor | fvdb.JaggedTensor | list[int] | None: ...
+
+    def __getitem__(self, key: str) -> torch.Tensor | fvdb.JaggedTensor | list[int] | None:  # type: ignore[override]
+        return super().__getitem__(key)
+
+    @overload
+    def get(self, key: Literal["pixel_coords"], default: None = None) -> torch.Tensor | None: ...
+    @overload
+    def get(
+        self, key: str, default: torch.Tensor | fvdb.JaggedTensor | list[int] | None = None
+    ) -> torch.Tensor | fvdb.JaggedTensor | list[int] | None: ...
+
+    def get(self, key: str, default: torch.Tensor | fvdb.JaggedTensor | list[int] | None = None) -> torch.Tensor | fvdb.JaggedTensor | list[int] | None:  # type: ignore[override]
+        return super().get(key, default)
 
     def __repr__(self):
-        return f"GARfVDBInput({super().__repr__()})"
+        return f"GARfVDBInput({dict(self)!r})"
 
     def to(self, device: torch.device, non_blocking: bool = True) -> "GARfVDBInput":
         return GARfVDBInput(
-            {k: v.to(device, non_blocking=non_blocking) if (type(v) in (torch.Tensor, fvdb.JaggedTensor)) else v for k, v in self.items()}  # type: ignore
+            {k: v.to(device, non_blocking=non_blocking) if isinstance(v, (torch.Tensor, fvdb.JaggedTensor)) else v for k, v in self.items()}  # type: ignore
         )
 
 
-def GARfVDBInputCollateFn(batch: List[SegmentationDataItem]) -> GARfVDBInput:
+def GARfVDBInputCollateFn(batch: List[SegmentationDataItem], collate_full_image: bool = False) -> GARfVDBInput:
     """Collate function for a DataLoader to stack the SegmentationDataItems into a GARfVDBInput.
     Args:
         batch: List of SegmentationDataItems.
@@ -241,5 +274,8 @@ def GARfVDBInputCollateFn(batch: List[SegmentationDataItem]) -> GARfVDBInput:
 
     if "pixel_coords" in batch[0]:
         kwargs["pixel_coords"] = torch.stack([cast(torch.Tensor, b.get("pixel_coords")) for b in batch])
+
+    if collate_full_image and "image_full" in batch[0]:
+        kwargs["image_full"] = torch.stack([cast(torch.Tensor, b.get("image_full")) for b in batch])
 
     return GARfVDBInput(**kwargs)

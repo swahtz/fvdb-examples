@@ -36,9 +36,8 @@ def main(gs_checkpoint_path: str, garfvdb_checkpoint_path: str, segmentation_dat
         collate_fn=dataset._collate_fn,
     )
 
-    quantile_transformer = model.get_quantile_transformer()
     scale = torch.tensor([[scale]])
-    scale = quantile_transformer(scale)[0, 0]
+    scale = model.quantile_transformer(scale)[0, 0]
 
     for i, sample in tqdm(enumerate(trainloader)):
         for k, v in sample.items():

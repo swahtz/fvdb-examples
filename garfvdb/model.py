@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 import logging
-from typing import Any, Callable, Literal, Union
+from typing import Any, Callable, Literal, Union, cast
 
 import fvdb
 import numpy as np
@@ -24,7 +24,7 @@ class SparseConvWithSkips(torch.nn.Module):
         super().__init__()
 
         self.kernel_size = 3
-        self.relu = fvdb.nn.ReLU()
+        self.relu = torch.nn.ReLU()
 
         # Initialize weights and ensure they require gradients
         for i in range(num_grids):
@@ -71,7 +71,7 @@ class GARfVDBModel(torch.nn.Module):
     The model consists of several key components:
     1. A Gaussian Splatting model for 3D scene representation
     2. Feature encoding grids or per-gaussian features
-    3. An optional sparse convolutional network for encoded feature processing
+    3. An optional sparse convolutional network for encoded feature processing [currently WIP]
     4. An MLP for feature transformation
 
     Attributes:
@@ -84,10 +84,21 @@ class GARfVDBModel(torch.nn.Module):
         mlp (torch.nn.Sequential): MLP for feature transformation
     """
 
+    ### Attributes ###
     mlp: torch.nn.Sequential
     encoder_gridbatch_features_data: torch.nn.Parameter | torch.Tensor
     encoder_gridbatch: fvdb.GridBatch
     encoder_convnet: SparseConvWithSkips | None
+
+    @staticmethod
+    def _state_dict_post_hook(module, state_dict, prefix, local_metadata):
+        """State dict post hook to also provide the encoder gridbatch.
+
+        Returns:
+            dict: The state dictionary of the model with the encoder gridbatch if it is used.
+        """
+        if module.model_config.use_grid:
+            state_dict["encoder_gridbatch"] = module.encoder_gridbatch.cpu()
 
     def __init__(
         self,
@@ -106,6 +117,8 @@ class GARfVDBModel(torch.nn.Module):
         """
 
         super().__init__()
+        # Because the encoder gridbatch is not a tensor that would be returned by the state_dict method,
+        # we need to register a post hook to add it to the state dict.
         self.register_state_dict_post_hook(self._state_dict_post_hook)
 
         self.device = device
@@ -113,21 +126,21 @@ class GARfVDBModel(torch.nn.Module):
         self.gs_model = gs_model
 
         # Build the quantile transformer
-        self.max_scale = torch.max(scale_stats)
-        self.quantile_transformer = self._get_quantile_func(scale_stats)
+        self._max_scale = torch.max(scale_stats)
+        self._quantile_transformer = self._get_quantile_func(scale_stats)
 
         ###  Encoded Features ###
         # When `use_grid` is True, we will use the GARField method of encoding features at different scales using
         # a set of 3D feature grids at a range of scene scales.  At training time, these features are sampled from the
-        # grids using the 3D centers of the rendered gaussians and weighted by their transmittance.
-        # When `use_grid` is False, we will store the encoded features per-3d-guassian and render the features directly
+        # grids using the 3D means of the rendered gaussians and weighted by their transmittance.
+        # When `use_grid` is False, we will store the encoded features per-3d-gaussian and render the features directly
         if self.model_config.use_grid:
             # GARField Encoder grids consist of two sets of 3D feature grids:
             # 1. 12 grids of number of voxels along each axis ranging from 16 -> 256
             # 2. 12 grids of number of voxels along each axis ranging from 256 -> 2048
             # Each grid has 8 feature channels
             resolution_range = [(16, 256), (256, 2048)]
-            num_grids = [12, 12]
+            num_grids = [self.model_config.num_grids // 2, self.model_config.num_grids // 2]
             # get the spatial extent of the means
             means = self.gs_model.means.detach()
             extent = means.max(dim=0).values - means.min(dim=0).values
@@ -161,18 +174,26 @@ class GARfVDBModel(torch.nn.Module):
                 self.encoder_convnet = SparseConvWithSkips(num_grids=sum(num_grids)).to(device)
 
         else:
-            # Initialize the per-gaussian features
-            gs_features = torch.nn.Parameter(
+            # Initialize the per-gaussian features and register as a parameter
+            self.gs_features = torch.nn.Parameter(
                 torch.zeros(
-                    [self.gs_model.means.shape[0], 1, self.model_config.gs_features],
+                    [self.gs_model.means.shape[0], 1, self.model_config.num_grids * self.model_config.grid_feature_dim],
                     device=device,
                 )
             )
-            state_dict["sh0"] = gs_features
-            self.gs_model.load_state_dict(state_dict)
-            # have to set requires_grad here because 'load_state_dict' will set all params to the 'require_grad' value
-            # from the state dict
-            self.gs_model.sh0.requires_grad = True
+
+            # Create reusable GaussianSplat3d for rendering - sh0 will be updated from gs_features
+            self._gs_model_for_render = fvdb.GaussianSplat3d.from_tensors(
+                means=self.gs_model.means.detach(),
+                quats=self.gs_model.quats.detach(),
+                log_scales=self.gs_model.log_scales.detach(),
+                logit_opacities=self.gs_model.logit_opacities.detach(),
+                sh0=self.gs_features.detach(),  # placeholder, will be overwritten
+                shN=torch.zeros(
+                    [self.gs_model.means.shape[0], 0, self.model_config.num_grids * self.model_config.grid_feature_dim],
+                    device=device,
+                ),
+            )
 
         ### MLP ###
         # GARField MLP ('instance net') uses 4 hidden layers with 256 units each, 256 output channels
@@ -180,27 +201,24 @@ class GARfVDBModel(torch.nn.Module):
         if self.model_config.use_grid:
             i_channels = self.model_config.grid_feature_dim * np.sum(num_grids) + 1
         else:
-            i_channels = self.model_config.gs_features + 1
+            i_channels = self.model_config.num_grids * self.model_config.grid_feature_dim + 1
         o_channels = self.model_config.mlp_output_dim
         n_neurons = self.model_config.mlp_hidden_dim
         hidden_layers = self.model_config.mlp_num_layers
 
         # Create MLP
-        mlp = torch.nn.Sequential(
+        self.mlp = torch.nn.Sequential(
             torch.nn.Linear(i_channels, n_neurons, bias=True),
             torch.nn.ReLU(),
             *[torch.nn.Linear(n_neurons, n_neurons, bias=True), torch.nn.ReLU()] * hidden_layers,
             torch.nn.Linear(n_neurons, o_channels, bias=False),
-        )
+        ).to(device)
 
-        # Initialize the MLP weights before moving to device
-        for layer in mlp:  # pyright: ignore[reportGeneralTypeIssues]
+        for layer in self.mlp:
             if isinstance(layer, torch.nn.Linear):
                 torch.nn.init.xavier_uniform_(layer.weight)
 
-        # Move to device and register
-        self.mlp = mlp.to(device)
-
+    ### Properties ###
     @property
     def enc_features(self) -> fvdb.JaggedTensor:
         """Get the encoded features.
@@ -210,13 +228,23 @@ class GARfVDBModel(torch.nn.Module):
         """
         return self.encoder_gridbatch.jagged_like(self.encoder_gridbatch_features_data)
 
-    def get_max_grouping_scale(self) -> torch.Tensor:
+    @property
+    def max_grouping_scale(self) -> torch.Tensor:
         """Get the maximum grouping scale.
 
         Returns:
-            float: The maximum grouping world space scale
+            torch.Tensor: The maximum grouping world space scale
         """
-        return self.max_scale
+        return self._max_scale
+
+    @property
+    def quantile_transformer(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        """The scale quantile transformer.
+
+        Returns:
+            Callable: The quantile transformer
+        """
+        return self._quantile_transformer
 
     @staticmethod
     def create_from_state_dict(
@@ -242,65 +270,17 @@ class GARfVDBModel(torch.nn.Module):
             model.encoder_gridbatch = state_dict["encoder_gridbatch"]
             model.encoder_gridbatch_features_data = torch.nn.Parameter(state_dict["encoder_gridbatch_features_data"])
         else:
-            model.gs_model.sh0 = state_dict["sh0"]
+            model.gs_features = torch.nn.Parameter(state_dict["gs_features"])
 
         # Extract MLP state dict by filtering keys that start with "mlp." and stripping the prefix
         mlp_state_dict = {k.replace("mlp.", "", 1): v for k, v in state_dict.items() if k.startswith("mlp.")}
         model.mlp.load_state_dict(mlp_state_dict)
         return model
 
-    # @staticmethod
-    # def create_from_checkpoint(
-    #     checkpoint_path: Union[str, Path],
-    #     gs_model: GaussianSplat3d,
-    #     scale_stats: torch.Tensor,
-    #     device: Union[str, torch.device] = torch.device("cuda"),
-    # ) -> "GARfVDBModel":
-    #     """Load the model checkpoint from the given path.
-
-    #     Args:
-    #         checkpoint_path: Path to the checkpoint
-    #     """
-    #     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    #     model_config = checkpoint["config"]["model"]
-    #     model = GARfVDBModel(gs_model, scale_stats, model_config, device)
-
-    #     if model_config.use_grid:
-    #         model.encoder_gridbatch = checkpoint["encoder_gridbatch"]
-    #         model.enc_features = checkpoint["encoder_features"]
-    #     else:
-    #         model.gs_model.sh0 = checkpoint["sh0"]
-    #     model.mlp.load_state_dict(checkpoint["mlp"])
-    #     return model
-
-    def save_checkpoint(self, checkpoint_path: str):
-        """Save the model checkpoint to the given path.
-
-        Args:
-            checkpoint_path: Path to the checkpoint
-        """
-        checkpoint = {}
-        checkpoint["model_config"] = self.model_config
-        if self.model_config.use_grid:
-            checkpoint["encoder_gridbatch"] = self.encoder_gridbatch.cpu()
-            checkpoint["encoder_features"] = self.enc_features.detach().cpu()
-        else:
-            checkpoint["sh0"] = self.gs_model.sh0.detach().cpu()
-        checkpoint["mlp"] = self.mlp.state_dict()
-        torch.save(checkpoint, checkpoint_path)
-
-    def get_quantile_transformer(self) -> Callable[[torch.Tensor], torch.Tensor]:
-        """Get the scale quantile transformer.
-
-        Returns:
-            Callable: The quantile transformer
-        """
-        return self.quantile_transformer
-
     def _get_quantile_func(
         self, scales: torch.Tensor, distribution: Literal["uniform", "normal"] = "normal"
     ) -> Callable[[torch.Tensor], torch.Tensor]:
-        """Use 3D scale statistics to normalize scales with quantile transformer.
+        """Produces a quantile transformer used to normalize scales with 3D scale statistics.
 
         Args:
             scales: [N] Tensor of scales
@@ -310,17 +290,17 @@ class GARfVDBModel(torch.nn.Module):
             Callable: The quantile transformer
         """
         scales = scales.flatten()
-        scales = scales[(scales > 0) & (scales < self.get_max_grouping_scale().item())]
+        scales = scales[(scales > 0) & (scales < self.max_grouping_scale.item())]
 
-        scales = scales.detach().cpu().numpy()  # type: ignore
+        scales_np = scales.detach().cpu().numpy()
 
         # Calculate quantile transformer
         quantile_transformer = QuantileTransformer(output_distribution=distribution)
-        quantile_transformer = quantile_transformer.fit(scales.reshape(-1, 1))
+        quantile_transformer = quantile_transformer.fit(scales_np.reshape(-1, 1))
 
-        def quantile_transformer_func(scales):
+        def quantile_transformer_func(scales: torch.Tensor) -> torch.Tensor:
             # This function acts as a wrapper for QuantileTransformer.
-            # QuantileTransformer expects a numpy array, while we have a torch tensor.
+            # QuantileTransformer expects a numpy array.
             # We need to preserve gradients, so we detach for the transform but then
             # re-attach gradients by using the original tensor in the computation
             scales_np = scales.detach().cpu().numpy()
@@ -352,26 +332,42 @@ class GARfVDBModel(torch.nn.Module):
         img_w = input["image_w"][0]
         img_h = input["image_h"][0]
         if not self.model_config.use_grid:
+            # Update sh0 with current gs_features before rendering
+            self._gs_model_for_render.sh0 = self.gs_features
+
             intrinsics = input["projection"]
             world_to_cam = input["world_to_camera"]
             pixel_coords = input.get("pixel_coords", None)  # [B, rays_per_image, 2]
 
-            features, opacity = self.gs_model.render_images(
-                image_width=img_w,
-                image_height=img_h,
-                world_to_camera_matrices=world_to_cam,
-                projection_matrices=intrinsics,
-                near=0.01,
-                far=1e10,
-                sh_degree_to_use=0,
-            )
-
-            # # select just the cam_pts that we need from the whole image if pixel_coords is specified
             if pixel_coords is not None:
-                batch_indices = torch.arange(features.shape[0]).view(-1, 1).expand(-1, pixel_coords.shape[1])
-                features = features[batch_indices, pixel_coords[:, :, 0], pixel_coords[:, :, 1]]
-                opacity = opacity[batch_indices, pixel_coords[:, :, 0], pixel_coords[:, :, 1]]
-            return features
+                features, _ = self._gs_model_for_render.sparse_render_images(
+                    pixels_to_render=fvdb.JaggedTensor(list(pixel_coords.unbind())),
+                    world_to_camera_matrices=world_to_cam,
+                    projection_matrices=intrinsics,
+                    image_width=img_w,
+                    image_height=img_h,
+                    near=0.01,
+                    far=1e10,
+                )
+                feature_size = features.eshape[-1]
+
+                cam_batch_size, num_rays_per_cam = pixel_coords.shape[:2]
+                # reshape features to [B, R, S, F]
+                return features.jdata.reshape(len(features), num_rays_per_cam, -1, feature_size)
+
+            else:
+                features, _ = self._gs_model_for_render.render_images(
+                    image_width=img_w,
+                    image_height=img_h,
+                    world_to_camera_matrices=world_to_cam,
+                    projection_matrices=intrinsics,
+                    near=0.01,
+                    far=1e10,
+                    sh_degree_to_use=0,
+                )
+                feature_size = features.shape[-1]
+                # reshape features to [B, H, W, S, F]
+                return features.reshape(len(features), img_h, img_w, -1, feature_size)
         else:
             intrinsics: torch.Tensor = input["projection"]
             world_to_cam: torch.Tensor = input["world_to_camera"]
@@ -426,8 +422,6 @@ class GARfVDBModel(torch.nn.Module):
                 # Sample one index per ray based on probabilities
                 # NOTE:  This probability would be much simpler if the division were just broadcastable
                 probs = []
-                # print("weights length: ", len(weights))
-                # print("weights jsum length: ", len(weights.jsum(dim=0, keepdim=True)))
                 for per_cam_weights, per_cam_weight_sum in zip(weights, weights.jsum(dim=0, keepdim=True)):
                     cam_probs = []
 
@@ -473,12 +467,6 @@ class GARfVDBModel(torch.nn.Module):
 
             unique_world_pts = self.gs_model.means[unique_ids]
 
-            # # debug test whether any of the points don't fall inside the grids' voxels
-            # in_voxels = self.encoder_grids.grid.points_in_active_voxel(unique_world_pts)
-            # num_not_in_voxels = (in_voxels.jdata == 0).sum().item()
-            # if num_not_in_voxels > 0:
-            #     logging.error(f"num_not_in_voxels: {num_not_in_voxels}")
-
             # sample the encoder grids at the unique world points
             enc_grid_sample_pts = fvdb.JaggedTensor(
                 [unique_world_pts for _ in range(self.encoder_gridbatch.grid_count)]
@@ -488,19 +476,18 @@ class GARfVDBModel(torch.nn.Module):
                 unique_enc_feats = conv_output.sample_trilinear(enc_grid_sample_pts)
             else:
                 unique_enc_feats = self.encoder_gridbatch.sample_trilinear(enc_grid_sample_pts, self.enc_features)
-            unique_cam_enc_feats = torch.cat(unique_enc_feats.unbind(), dim=-1)  # [unique_ids, F]
+            # NOTE: Cast is just to satisfy the type checker
+            unique_cam_enc_feats = torch.cat(
+                cast(list[torch.Tensor], unique_enc_feats.unbind()), dim=-1
+            )  # [unique_ids, F]
             # re-assemble the enc_feats based on the original ids
             enc_feats = unique_cam_enc_feats[unique_ids_inverse].squeeze(-2)  # [B, R, S, F]
             enc_feats = fvdb.JaggedTensor.from_data_offsets_and_list_ids(enc_feats, ids.joffsets, ids.jlidx)
 
             if not self.model_config.enc_feats_one_idx_per_ray:
                 # Weighted sum of the enc_feats and transmittance weights
-                # weights = weights.unsqueeze(-1)  # [B, R, S, 1] or [B, H, W, S, 1]
-
-                # multiply by weights
                 enc_feats.jdata = enc_feats.jdata * weights.jdata.unsqueeze(-1)
                 enc_feats = enc_feats.jsum(dim=0, keepdim=True)
-                # enc_feats = enc_feats.sum(dim=-2)  # [B, R, F] or [B, H, W, F]
 
             epsilon = 1e-6
             enc_feats.jdata = enc_feats.jdata / (torch.linalg.norm(enc_feats.jdata, dim=-1, keepdim=True) + epsilon)
@@ -526,9 +513,6 @@ class GARfVDBModel(torch.nn.Module):
             MLP output [B, R, F] or [B, H, W, F]
         """
         epsilon = 1e-5
-
-        # Debug print to understand shapes
-        logging.debug(f"get_mlp_output shapes: enc_feats={enc_feats.shape}, scales={scales.shape}")
 
         # Process scales
         # Flatten for processing
@@ -566,20 +550,26 @@ class GARfVDBModel(torch.nn.Module):
         cam_to_world = input["camera_to_world"]
         world_to_cam = torch.linalg.inv(cam_to_world).contiguous()
 
-        # Obtain per-gaussian features from the encoder grids
-        world_pts = fvdb.JaggedTensor([self.gs_model.means for _ in range(self.encoder_gridbatch.grid_count)])
-        if self.model_config.use_grid_conv:
-            conv_output = self.encoder_convnet(self.encoder_grids)
-            enc_feats = conv_output.sample_trilinear(world_pts)
+        if self.model_config.use_grid:
+            # Obtain per-gaussian features from the encoder grids
+            world_pts = fvdb.JaggedTensor([self.gs_model.means for _ in range(self.encoder_gridbatch.grid_count)])
+            if self.model_config.use_grid_conv:
+                conv_output = self.encoder_convnet(self.encoder_grids)
+                enc_feats = conv_output.sample_trilinear(world_pts)
+            else:
+                enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
+            # NOTE: Cast is just to satisfy the type checker
+            enc_feats = torch.cat(cast(list[torch.Tensor], enc_feats.unbind()), dim=-1)  # [N, F]
+
+            # Set them as the sh0 features
+            enc_feats_state_dict = self.gs_model.state_dict()
+            enc_feats_state_dict["sh0"] = rgb_to_sh(enc_feats).unsqueeze(1).contiguous()
+
+            gs3d_enc_feats = GaussianSplat3d.from_state_dict(enc_feats_state_dict)
         else:
-            enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
-        enc_feats = torch.cat(enc_feats.unbind(), dim=-1)  # [N, F]
-
-        # Set them as the sh0 features
-        enc_feats_state_dict = self.gs_model.state_dict()
-        enc_feats_state_dict["sh0"] = rgb_to_sh(enc_feats).unsqueeze(1).contiguous()
-
-        gs3d_enc_feats = GaussianSplat3d.from_state_dict(enc_feats_state_dict)
+            # Update sh0 with current gs_features and reuse the model
+            self._gs_model_for_render.sh0 = self.gs_features
+            gs3d_enc_feats = self._gs_model_for_render
 
         # Render the image
         img_feats, alpha = gs3d_enc_feats.render_images(
@@ -600,12 +590,3 @@ class GARfVDBModel(torch.nn.Module):
         gfeats = self.get_mlp_output(img_feats, scales)
 
         return gfeats, alpha
-
-    @staticmethod
-    def _state_dict_post_hook(module, state_dict, prefix, local_metadata):
-        """Get the state dictionary of the model.
-
-        Returns:
-            dict: The state dictionary of the model.
-        """
-        state_dict["encoder_gridbatch"] = module.encoder_gridbatch.cpu()

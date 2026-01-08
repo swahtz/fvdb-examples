@@ -14,10 +14,7 @@ import torchvision.transforms.functional as tvF
 import tqdm
 from fvdb import GaussianSplat3d
 from fvdb_reality_capture.sfm_scene import SfmScene
-from fvdb_reality_capture.tools import (
-    filter_splats_above_scale,
-    filter_splats_by_mean_percentile,
-)
+from fvdb_reality_capture.tools import filter_splats_above_scale
 from torch.utils.tensorboard import SummaryWriter
 
 from garfvdb.config import GARfVDBModelConfig, GaussianSplatSegmentationTrainingConfig
@@ -363,21 +360,7 @@ class GaussianSplatScaleConditionedSegmentation:
         logger.info(f"Model initialized with {gs_model.num_gaussians:,} Gaussians")
 
         ## Initialize Optimizer
-        # Different parameter groups with separate learning rates
         lr = 1e-5
-        param_groups = [
-            {"params": model.mlp.parameters(), "lr": lr},  # Base learning rate for MLP
-        ]
-
-        # Add grid parameters with different learning rate if using grid
-        if config.model.use_grid:
-            param_groups.append({"params": [model.encoder_gridbatch_features_data], "lr": lr})
-            if config.model.use_grid_conv:
-                param_groups.append({"params": model.encoder_convnet.parameters(), "lr": lr})
-        else:
-            # For sh0 model, add the sh0 parameter
-            param_groups.append({"params": [model.gs_model.sh0], "lr": lr})  # Lower learning rate for sh0
-
         optimizer = torch.optim.Adam(
             params=model.parameters(),
             lr=lr,
@@ -478,12 +461,12 @@ class GaussianSplatScaleConditionedSegmentation:
 
         # Disable gradients on GS model tensors if eval_only
         if eval_only:
-            gs_model.means.requires_grad_(False)
-            gs_model.quats.requires_grad_(False)
-            gs_model.log_scales.requires_grad_(False)
-            gs_model.logit_opacities.requires_grad_(False)
-            gs_model.sh0.requires_grad_(False)
-            gs_model.shN.requires_grad_(False)
+            gs_model.means.detach_()
+            gs_model.quats.detach_()
+            gs_model.log_scales.detach_()
+            gs_model.logit_opacities.detach_()
+            gs_model.sh0.detach_()
+            gs_model.shN.detach_()
 
         # Get train/val indices
         train_indices = np.array(state_dict["train_indices"], dtype=int)
@@ -723,7 +706,7 @@ class GaussianSplatScaleConditionedSegmentation:
 
         self._logger.info("Training completed.")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def eval(self, log_tag: str = "eval") -> None:
         """
         Run evaluation of the Gaussian Splatting model on the validation dataset.
@@ -733,39 +716,46 @@ class GaussianSplatScaleConditionedSegmentation:
         """
         self._logger.info("Running evaluation...")
 
-        valloader = torch.utils.data.DataLoader(self._validation_dataset, batch_size=1, shuffle=False, num_workers=1)
+        valloader = torch.utils.data.DataLoader(
+            self._validation_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            collate_fn=lambda batch: GARfVDBInputCollateFn(batch, collate_full_image=True),
+        )
 
         ## Log metrics
         metrics = {"psnr": [], "loss": []}
         for val_batch in valloader:
-            for k, v in val_batch.items():
-                val_batch[k] = v.to(self.device)
+            val_batch = val_batch.to(self.device)
             val_enc_feats = self._model.get_encoded_features(val_batch)
             val_loss_dict = calculate_loss(self._model, val_enc_feats, val_batch)
             metrics["loss"].append(val_loss_dict["total_loss"])
 
-        loss_mean = torch.stack(metrics["loss"]).mean()
+        loss_mean = torch.stack(metrics["loss"]).mean().cpu()
 
         self._logger.info(f"Evaluation for stage {log_tag} completed. Average loss: {loss_mean.item():.3f}")
 
         self._writer.log_metric(self._global_step, f"{log_tag}/loss", loss_mean.item())
 
+        # Clean up memory because no-grid rendering is memory intensive
+        del loss_mean, metrics
+        torch.cuda.empty_cache()
+
         ## Validation image
-        val_batch = next(iter(valloader))
-        for k, v in val_batch.items():
-            val_batch[k] = v.to(self.device)
+        val_batch = next(iter(valloader)).to(self.device)
 
         world_to_cam_matrix = val_batch["world_to_camera"]
         projection_matrix = val_batch["projection"]
-        img_w, img_h = val_batch["image_full"].shape[2], val_batch["image_full"].shape[1]
-        beauty_output, _ = self._gs_model.render_images(
+        beauty_gt = val_batch["image_full"]
+        img_w, img_h = val_batch["image_w"][0], val_batch["image_h"][0]
+        beauty_output, _ = self.gs_model.render_images(
             world_to_cam_matrix,
             projection_matrix,
             img_w,
             img_h,
             0.01,
             1e10,
-            # 0,  # sh_degree_to_use
         )
         # Ground truth and rendered image for reference
         beauty_output = torch.clamp(beauty_output, 0.0, 1.0)
@@ -776,9 +766,8 @@ class GaussianSplatScaleConditionedSegmentation:
                 0, 2, 3, 1
             )
 
-        downscaled_beauty_output = downscale(beauty_output)
-        self._writer.save_image(self._global_step, f"{log_tag}/beauty_image.jpg", downscaled_beauty_output.cpu())
-        beauty_gt = val_batch["image_full"]
+        self._writer.save_image(self._global_step, f"{log_tag}/beauty_image.jpg", downscale(beauty_output).cpu())
+
         self._writer.save_image(self._global_step, f"{log_tag}/ground_truth_image.jpg", downscale(beauty_gt).cpu())
 
         # Mask outpus at 10% of the maximum scale

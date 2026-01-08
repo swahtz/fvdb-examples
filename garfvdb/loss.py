@@ -216,7 +216,7 @@ def calculate_loss(
     # 2. If ", then also supervise them to be similar at s > s_A
     # if self.config.use_hierarchy_losses and (not self.config.use_single_scale):
 
-    scale_diff = torch.max(torch.zeros_like(scales), (model.get_max_grouping_scale() - scales))
+    scale_diff = torch.max(torch.zeros_like(scales), (model.max_grouping_scale - scales))
     larger_scale = scales + scale_diff * torch.rand(size=(1,), device=scales.device)
 
     # Get larger scale features and flatten

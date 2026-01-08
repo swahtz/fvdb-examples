@@ -7,12 +7,14 @@ import time
 from dataclasses import dataclass
 from typing import Annotated, Optional
 
+import cv2
 import fvdb.viz as fviz
 import numpy as np
 import torch
 import tyro
 from fvdb import GaussianSplat3d
 from fvdb.types import to_Mat33fBatch, to_Mat44fBatch, to_Vec2iBatch
+from fvdb_reality_capture.tools import filter_splats_above_scale
 from tyro.conf import arg
 
 from garfvdb.model import GARfVDBModel
@@ -148,8 +150,8 @@ class SegmentationRenderer:
             {
                 "projection": projection.unsqueeze(0),
                 "camera_to_world": camera_to_world.unsqueeze(0),
-                "image_w": torch.tensor([img_w]).to(self.device),
-                "image_h": torch.tensor([img_h]).to(self.device),
+                "image_w": [img_w],
+                "image_h": [img_h],
             }
         )
 
@@ -157,11 +159,19 @@ class SegmentationRenderer:
             # Render the mask features
             mask_features_output, mask_alpha = self.segmentation_model.get_mask_output(model_input, self.scale)
 
+            # Debug: Check for invalid values in render output
+            has_nan = torch.isnan(mask_features_output).any().item()
+            has_inf = torch.isinf(mask_features_output).any().item()
+
+            # If there are NaN/Inf values, skip PCA and return a fallback
+            if has_nan or has_inf:
+                self._logger.error("Invalid values detected in mask features! Returning fallback image.")
+                return np.zeros((img_h, img_w, 4), dtype=np.uint8)
+
             # Apply PCA projection
             mask_pca = self._apply_pca_projection(
                 mask_features_output, 3, valid_feature_mask=mask_alpha.squeeze(-1) > 0
             )[0]
-
             # Blend mask output based on blend factor
             mask_alpha *= self.mask_blend
 
@@ -229,6 +239,9 @@ class ViewCheckpoint:
     # Disable the segmentation overlay (just show Gaussian splats)
     no_overlay: bool = False
 
+    # Downsample factor for the overlay resolution (1 = full resolution, 2 = half, etc.)
+    overlay_downsample: int = 1
+
     def execute(self) -> None:
         """Execute the viewer command."""
         log_level = logging.DEBUG if self.verbose else logging.INFO
@@ -246,6 +259,7 @@ class ViewCheckpoint:
             raise FileNotFoundError(f"Reconstruction checkpoint {self.reconstruction_path} does not exist.")
         logger.info(f"Loading Gaussian splat model from {self.reconstruction_path}")
         gs_model, metadata = load_splats_from_file(self.reconstruction_path, device)
+        gs_model = filter_splats_above_scale(gs_model, 0.1)
         logger.info(f"Loaded {gs_model.num_gaussians:,} Gaussians")
 
         # Load the segmentation runner from checkpoint
@@ -314,9 +328,13 @@ class ViewCheckpoint:
 
         # Get overlay dimensions from training image sizes (use first camera's size)
         assert image_sizes is not None
-        overlay_width = int(image_sizes[0, 0].item())
-        overlay_height = int(image_sizes[0, 1].item())
-        logger.info(f"Using training image size for overlay: {overlay_width}x{overlay_height}")
+        img_w = int(image_sizes[0, 0].item())
+        img_h = int(image_sizes[0, 1].item())
+        render_overlay_width = img_w // self.overlay_downsample
+        render_overlay_height = img_h // self.overlay_downsample
+        logger.info(
+            f"Using overlay resolution: {render_overlay_width}x{render_overlay_height} (downsample: {self.overlay_downsample}x)"
+        )
 
         # Add the Gaussian splat model to the scene
         viz_scene.add_gaussian_splat_3d("Gaussian Splats", gs_model)
@@ -326,14 +344,14 @@ class ViewCheckpoint:
         if not self.no_overlay:
             try:
                 # Create an initial blank image
-                initial_image = np.zeros((overlay_height, overlay_width, 4), dtype=np.uint8)
+                initial_image = np.zeros((img_h, img_w, 4), dtype=np.uint8)
                 initial_image[..., 3] = 128  # Semi-transparent
 
                 # Add the image overlay using the add_image API
                 image_view = viz_scene.add_image(  # type: ignore[call-arg]
                     name="Segmentation Overlay",
-                    width=overlay_width,
-                    height=overlay_height,
+                    width=img_w,
+                    height=img_h,
                     rgba_image=initial_image.flatten(),
                 )
                 logger.info("Segmentation overlay enabled")
@@ -353,7 +371,7 @@ class ViewCheckpoint:
         logger.info(f"  - Scale: {renderer.scale:.4f} (max: {segmentation_model.max_scale:.4f})")
         logger.info(f"  - Mask blend: {renderer.mask_blend:.2f}")
         if image_view is not None:
-            logger.info(f"  - Overlay resolution: {overlay_width}x{overlay_height}")
+            logger.info(f"  - Overlay resolution: {render_overlay_width}x{render_overlay_height}")
             logger.info(f"  - Update interval: {self.camera_check_interval}s")
         else:
             logger.info("  - Overlay: DISABLED")
@@ -454,10 +472,12 @@ class ViewCheckpoint:
                 camera_to_world = torch.from_numpy(c2w_opencv).float().to(renderer.device)
 
                 rgba_image = renderer.render_segmentation_image(
-                    camera_to_world, reference_projection, overlay_width, overlay_height
+                    camera_to_world, reference_projection, render_overlay_width, render_overlay_height
                 )
+                # resize to the overlay resolution
+                rgba_image = cv2.resize(rgba_image, (img_w, img_h))
                 image_view.update(rgba_image.flatten())  # type: ignore[attr-defined]
-                logger.debug(f"Updated segmentation overlay ({overlay_width}x{overlay_height})")
+                logger.debug(f"Updated segmentation overlay ({render_overlay_width}x{render_overlay_height})")
             except Exception as e:
                 logger.warning(f"Error updating overlay: {e}")
                 import traceback

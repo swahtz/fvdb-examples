@@ -22,14 +22,14 @@ from garfvdb.scene_transforms import ComputeImageSegmentationMasksWithScales
 
 @dataclass
 class GARfVDBModelConfig:
-    """Configuration parameters specific to the model."""
+    """Configuration parameters specific to the GARfVDB model."""
 
     depth_samples: int = 24
     use_grid: bool = True
     use_grid_conv: bool = False
     enc_feats_one_idx_per_ray: bool = False
+    num_grids: int = 24
     grid_feature_dim: int = 8
-    gs_features: int = 192
     mlp_hidden_dim: int = 256
     mlp_num_layers: int = 4
     mlp_output_dim: int = 256
