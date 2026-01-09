@@ -796,9 +796,9 @@ class GaussianSplatScaleConditionedSegmentation:
                 0, 2, 3, 1
             )
 
-        self._writer.save_image(self._global_step, f"{log_tag}/beauty_image.jpg", downscale(beauty_output).cpu())
-
-        self._writer.save_image(self._global_step, f"{log_tag}/ground_truth_image.jpg", downscale(beauty_gt).cpu())
+        # Save reference images to step 0 (they don't change during training)
+        self._writer.save_image(0, f"{log_tag}/beauty_image.jpg", downscale(beauty_output).cpu())
+        self._writer.save_image(0, f"{log_tag}/ground_truth_image.jpg", downscale(beauty_gt).cpu())
 
         # Mask outputs at 10% of the maximum scale
         desired_scale = torch.max(val_batch["scales"]) * 0.1
