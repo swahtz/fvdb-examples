@@ -14,7 +14,7 @@ from garfvdb.training.dataset import SegmentationDataItem, SegmentationDataset
 
 
 class TransformedSegmentationDataset(Dataset):
-    """A dataset that applies transforms to the base dataset."""
+    """A dataset that applies Torchvision-style transforms to the base dataset."""
 
     def __init__(self, base_dataset: SegmentationDataset, transform=None):
         self._base_dataset = base_dataset
@@ -223,8 +223,8 @@ class Resize:
         )  # back to [H * scale, W * scale, 3]
 
         # Update dimensions
-        item["image_h"] = [int(item["image_h"][0] * self.scale)]
-        item["image_w"] = [int(item["image_w"][0] * self.scale)]
+        item["image_h"] = int(item["image_h"] * self.scale)
+        item["image_w"] = int(item["image_w"] * self.scale)
 
         # Resize masks similarly
         item["mask_cdf"] = (

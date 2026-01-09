@@ -5,7 +5,7 @@ import logging
 import os
 import pathlib
 import random
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -139,6 +139,7 @@ class GaussianSplatScaleConditionedSegmentation:
         log_interval_steps: int,
         viewer_update_interval_epochs: int,
         grouping_scale_stats: torch.Tensor | None = None,
+        viz_callback: Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None = None,
         _private: object | None = None,
     ) -> None:
         """
@@ -163,6 +164,8 @@ class GaussianSplatScaleConditionedSegmentation:
             log_interval_steps (int): How often to log metrics to TensorBoard.
             viewer_update_interval_epochs (int): How often to update the viewer.
             grouping_scale_stats (torch.Tensor | None): The scale statistics of the GaussianSplat3d model.
+            viz_callback (Callable | None): Optional callback function called at epoch boundaries for visualization.
+                The callback receives the runner instance and the current epoch number.
             _private (object | None): Private object to ensure this class is only initialized
                 through `new` or `resume_from_checkpoint`.
         """
@@ -215,6 +218,7 @@ class GaussianSplatScaleConditionedSegmentation:
         self._writer = writer
         self._log_interval_steps = log_interval_steps
         self._viewer_update_interval_epochs = viewer_update_interval_epochs
+        self._viz_callback = viz_callback
 
     @property
     def total_steps(self) -> int:
@@ -292,6 +296,7 @@ class GaussianSplatScaleConditionedSegmentation:
         use_every_n_as_val: int = 100,
         viewer_update_interval_epochs: int = 10,
         log_interval_steps: int = 10,
+        viz_callback: Callable[["GaussianSplatScaleConditionedSegmentation", int], None] | None = None,
     ) -> "GaussianSplatScaleConditionedSegmentation":
         """
         Create a `GaussianSplatScaleConditionedSegmentation` instance for a new training run.
@@ -306,6 +311,8 @@ class GaussianSplatScaleConditionedSegmentation:
             use_every_n_as_val (int): Use every nth image as validation data.
             viewer_update_interval_epochs (int): How often to update the viewer.
             log_interval_steps (int): How often to log metrics to TensorBoard.
+            viz_callback (Callable | None): Optional callback function called at epoch boundaries for visualization.
+                The callback receives the runner instance and the current epoch number.
 
         Returns:
             GaussianSplatScaleConditionedSegmentation: A `GaussianSplatScaleConditionedSegmentation` instance initialized with the specified configuration and datasets.
@@ -395,6 +402,7 @@ class GaussianSplatScaleConditionedSegmentation:
             log_interval_steps=log_interval_steps,
             viewer_update_interval_epochs=viewer_update_interval_epochs,
             start_step=0,
+            viz_callback=viz_callback,
             _private=GaussianSplatScaleConditionedSegmentation.__PRIVATE__,
         )
 
@@ -682,6 +690,17 @@ class GaussianSplatScaleConditionedSegmentation:
             if epoch > prev_epoch:
                 prev_epoch = epoch
 
+                # Update visualization if enabled
+                if (
+                    self._viz_callback is not None
+                    and self._viewer_update_interval_epochs > 0
+                    and epoch % self._viewer_update_interval_epochs == 0
+                ):
+                    try:
+                        self._viz_callback(self, epoch)
+                    except Exception as e:
+                        self._logger.warning(f"Visualization callback failed: {e}")
+
                 # Save the model if we've reached a percentage of the total epochs specified in save_at_percent
                 if epoch in [pct * self._cfg.max_epochs // 100 for pct in self._cfg.save_at_percent]:
                     logging.info(f"Saving checkpoint at epoch {epoch}")
@@ -770,7 +789,7 @@ class GaussianSplatScaleConditionedSegmentation:
 
         self._writer.save_image(self._global_step, f"{log_tag}/ground_truth_image.jpg", downscale(beauty_gt).cpu())
 
-        # Mask outpus at 10% of the maximum scale
+        # Mask outputs at 10% of the maximum scale
         desired_scale = torch.max(val_batch["scales"]) * 0.1
 
         val_mask_output, mask_alpha = self._model.get_mask_output(val_batch, desired_scale.item())

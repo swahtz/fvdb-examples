@@ -1,6 +1,7 @@
 data/
 results/
 sam2/checkpoints
+nsys/
 __pycache__
 *.egg-info
 
@@ -8,3 +9,4 @@ __pycache__
 **/frgs_logs/
 **/fvdb_gslogs
 **/logs/
+**/*.ply

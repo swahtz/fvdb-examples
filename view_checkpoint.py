@@ -87,7 +87,7 @@ class SegmentationRenderer:
         self.device = device
 
         # Renderer state
-        self.scale = 0.1 * segmentation_model.max_scale
+        self.scale = float(segmentation_model.max_grouping_scale.item()) * 0.1
         self.mask_blend = 0.5
         self.freeze_pca = False
         self.frozen_pca_projection: Optional[torch.Tensor] = None
@@ -239,8 +239,14 @@ class ViewCheckpoint:
     # Disable the segmentation overlay (just show Gaussian splats)
     no_overlay: bool = False
 
-    # Downsample factor for the overlay resolution (1 = full resolution, 2 = half, etc.)
-    overlay_downsample: int = 1
+    # Width of the segmentation overlay in the viewer
+    overlay_width: int = 1920
+
+    # Height of the segmentation overlay in the viewer
+    overlay_height: int = 1080
+
+    # Downsample factor for rendering (renders at overlay_size / overlay_downsample, then scales up)
+    overlay_downsample: int = 2
 
     def execute(self) -> None:
         """Execute the viewer command."""
@@ -279,7 +285,7 @@ class ViewCheckpoint:
 
         logger.info(f"Loaded {gs_model.num_gaussians:,} Gaussians")
         logger.info(f"Restored SfmScene with {sfm_scene.num_images} images (with correct scale transforms)")
-        logger.info(f"Segmentation model max scale: {segmentation_model.max_scale:.4f}")
+        logger.info(f"Segmentation model max scale: {segmentation_model.max_grouping_scale:.4f}")
 
         # Create the renderer
         renderer = SegmentationRenderer(
@@ -287,7 +293,7 @@ class ViewCheckpoint:
             segmentation_model=segmentation_model,
             device=device,
         )
-        renderer.scale = self.initial_scale * segmentation_model.max_scale
+        renderer.scale = self.initial_scale * float(segmentation_model.max_grouping_scale.item())
         renderer.mask_blend = self.initial_blend
 
         # Initialize fvdb.viz
@@ -326,15 +332,15 @@ class ViewCheckpoint:
                 image_sizes=image_sizes,
             )
 
-        # Get overlay dimensions from training image sizes (use first camera's size)
+        # Get original training image size for projection scaling
         assert image_sizes is not None
-        img_w = int(image_sizes[0, 0].item())
-        img_h = int(image_sizes[0, 1].item())
-        render_overlay_width = img_w // self.overlay_downsample
-        render_overlay_height = img_h // self.overlay_downsample
-        logger.info(
-            f"Using overlay resolution: {render_overlay_width}x{render_overlay_height} (downsample: {self.overlay_downsample}x)"
-        )
+        orig_img_w = int(image_sizes[0, 0].item())
+        orig_img_h = int(image_sizes[0, 1].item())
+
+        # Compute render dimensions (smaller for performance)
+        render_w = self.overlay_width // self.overlay_downsample
+        render_h = self.overlay_height // self.overlay_downsample
+        logger.info(f"Overlay: {self.overlay_width}x{self.overlay_height}, render: {render_w}x{render_h}")
 
         # Add the Gaussian splat model to the scene
         viz_scene.add_gaussian_splat_3d("Gaussian Splats", gs_model)
@@ -343,15 +349,15 @@ class ViewCheckpoint:
         image_view = None
         if not self.no_overlay:
             try:
-                # Create an initial blank image
-                initial_image = np.zeros((img_h, img_w, 4), dtype=np.uint8)
+                # Create an initial blank image at full overlay resolution
+                initial_image = np.zeros((self.overlay_height, self.overlay_width, 4), dtype=np.uint8)
                 initial_image[..., 3] = 128  # Semi-transparent
 
                 # Add the image overlay using the add_image API
                 image_view = viz_scene.add_image(  # type: ignore[call-arg]
                     name="Segmentation Overlay",
-                    width=img_w,
-                    height=img_h,
+                    width=self.overlay_width,
+                    height=self.overlay_height,
                     rgba_image=initial_image.flatten(),
                 )
                 logger.info("Segmentation overlay enabled")
@@ -368,10 +374,10 @@ class ViewCheckpoint:
         logger.info(f"Open your browser to http://{self.viewer_ip_address}:{self.viewer_port}")
         logger.info("")
         logger.info("Segmentation settings:")
-        logger.info(f"  - Scale: {renderer.scale:.4f} (max: {segmentation_model.max_scale:.4f})")
+        logger.info(f"  - Scale: {renderer.scale:.4f} (max: {segmentation_model.max_grouping_scale:.4f})")
         logger.info(f"  - Mask blend: {renderer.mask_blend:.2f}")
         if image_view is not None:
-            logger.info(f"  - Overlay resolution: {render_overlay_width}x{render_overlay_height}")
+            logger.info(f"  - Overlay: {self.overlay_width}x{self.overlay_height} (render: {render_w}x{render_h})")
             logger.info(f"  - Update interval: {self.camera_check_interval}s")
         else:
             logger.info("  - Overlay: DISABLED")
@@ -420,9 +426,18 @@ class ViewCheckpoint:
             except Exception:
                 return False
 
-        # Get reference projection from SfmScene (for correct intrinsics)
-        sfm_projection = torch.from_numpy(sfm_scene.projection_matrices).float().to(device)
-        reference_projection = sfm_projection[0]
+        # Get reference projection from SfmScene and scale for render resolution
+        sfm_projection = torch.from_numpy(sfm_scene.projection_matrices).float()
+        orig_projection = sfm_projection[0]
+        # Scale the projection matrix from original training image size to render resolution
+        scale_x = render_w / orig_img_w
+        scale_y = render_h / orig_img_h
+        scaled_projection = orig_projection.clone()
+        scaled_projection[0, 0] *= scale_x  # fx
+        scaled_projection[1, 1] *= scale_y  # fy
+        scaled_projection[0, 2] *= scale_x  # cx
+        scaled_projection[1, 2] *= scale_y  # cy
+        reference_projection = scaled_projection.to(device)
 
         # OpenGL to OpenCV conversion matrix (applied to camera axes)
         # OpenGL: X-right, Y-up, Z-backward
@@ -471,13 +486,19 @@ class ViewCheckpoint:
 
                 camera_to_world = torch.from_numpy(c2w_opencv).float().to(renderer.device)
 
+                # Render at lower resolution for performance
                 rgba_image = renderer.render_segmentation_image(
-                    camera_to_world, reference_projection, render_overlay_width, render_overlay_height
+                    camera_to_world, reference_projection, render_w, render_h
                 )
-                # resize to the overlay resolution
-                rgba_image = cv2.resize(rgba_image, (img_w, img_h))
+                # Scale up to overlay resolution
+                if self.overlay_downsample > 1:
+                    rgba_image = cv2.resize(
+                        rgba_image, (self.overlay_width, self.overlay_height), interpolation=cv2.INTER_LINEAR
+                    )
                 image_view.update(rgba_image.flatten())  # type: ignore[attr-defined]
-                logger.debug(f"Updated segmentation overlay ({render_overlay_width}x{render_overlay_height})")
+                logger.debug(
+                    f"Updated segmentation overlay ({render_w}x{render_h} -> {self.overlay_width}x{self.overlay_height})"
+                )
             except Exception as e:
                 logger.warning(f"Error updating overlay: {e}")
                 import traceback
