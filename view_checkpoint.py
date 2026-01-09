@@ -214,44 +214,44 @@ class ViewCheckpoint:
                 --reconstruction-path ./gsplat_checkpoint.ply
     """
 
-    #: Path to the GARfVDB segmentation checkpoint (.pt or .pth).
     segmentation_path: Annotated[pathlib.Path, arg(aliases=["-s"])]
+    """Path to the GARfVDB segmentation checkpoint (.pt or .pth)."""
 
-    #: Path to the Gaussian splat reconstruction checkpoint.
     reconstruction_path: Annotated[pathlib.Path, arg(aliases=["-r"])]
+    """Path to the Gaussian splat reconstruction checkpoint."""
 
-    #: Port to expose the viewer server on.
     viewer_port: Annotated[int, arg(aliases=["-p"])] = 8080
+    """Port to expose the viewer server on."""
 
-    #: IP address to expose the viewer server on.
     viewer_ip_address: Annotated[str, arg(aliases=["-ip"])] = "127.0.0.1"
+    """IP address to expose the viewer server on."""
 
-    #: Enable verbose logging.
     verbose: Annotated[bool, arg(aliases=["-v"])] = False
+    """Enable verbose logging."""
 
-    #: Device for computation (e.g., "cuda" or "cpu").
     device: str | torch.device = "cuda"
+    """Device for computation (e.g., "cuda" or "cpu")."""
 
-    #: Initial segmentation scale as a fraction of max scale.
     initial_scale: float = 0.1
+    """Initial segmentation scale as a fraction of max scale."""
 
-    #: Initial mask blend factor (0=beauty only, 1=mask only).
     initial_blend: float = 0.5
+    """Initial mask blend factor (0=beauty only, 1=mask only)."""
 
-    #: Camera change polling interval in seconds.
     camera_check_interval: float = 0.5
+    """Camera change polling interval in seconds."""
 
-    #: Disable the segmentation overlay (show Gaussian splats only).
     no_overlay: bool = False
+    """Disable the segmentation overlay (show Gaussian splats only)."""
 
-    #: Width of the segmentation overlay in pixels.
     overlay_width: int = 1920
+    """Width of the segmentation overlay in pixels."""
 
-    #: Height of the segmentation overlay in pixels.
     overlay_height: int = 1080
+    """Height of the segmentation overlay in pixels."""
 
-    #: Downsample factor for rendering (renders at overlay_size/downsample).
     overlay_downsample: int = 2
+    """Downsample factor for rendering (renders at overlay_size/downsample)."""
 
     def execute(self) -> None:
         """Execute the viewer command."""
