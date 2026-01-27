@@ -382,6 +382,7 @@ class GARfVDBModel(torch.nn.Module):
         img_w = input["image_w"][0]
         img_h = input["image_h"][0]
         if not self.model_config.use_grid:
+            ## Naive segmentation (storing features at each gaussian, not on the encoder grids)
             # Update sh0 with current gs_features before rendering
             self._gs_model_for_render.sh0 = self.gs_features
 
@@ -649,27 +650,55 @@ class GARfVDBModel(torch.nn.Module):
         if self.model_config.use_grid:
             # Obtain per-gaussian features from the encoder grids
 
-            # repeat the gaussian means for each grid
+            # Frustum cull to find visible gaussians
+            projected_gaussians = self.gs_model.project_gaussians_for_depths(
+                world_to_cam, intrinsics, img_w, img_h, near=0.01, far=1e10
+            )
+            visible_mask = projected_gaussians.radii[0] > 0
+            visible_ids = torch.nonzero(visible_mask, as_tuple=True)[0]
+
             num_points = self.gs_model.means.shape[0]
             grid_count = self.encoder_gridbatch.grid_count
-            repeated_data = self.gs_model.means.repeat(grid_count, 1)
-            # Create offsets: [0, N, 2N, 3N, ..., grid_count*N]
-            offsets = torch.arange(
-                0, (grid_count + 1) * num_points, num_points, device=self.gs_model.means.device, dtype=torch.long
-            )
-            world_pts = fvdb.JaggedTensor.from_data_and_offsets(repeated_data, offsets)
+            num_visible = len(visible_ids)
 
-            if self.model_config.use_grid_conv:
-                conv_output = self.encoder_convnet(self.encoder_grids)
-                enc_feats = conv_output.sample_trilinear(world_pts)
+            if num_visible > 0:
+                # Only sample trilinear at visible Gaussian positions
+                visible_means = self.gs_model.means[visible_ids]  # [num_visible, 3]
+                repeated_data = visible_means.repeat(grid_count, 1)  # [grid_count * num_visible, 3]
+                # Create offsets: [0, V, 2V, ..., grid_count*V] where V = num_visible
+                offsets = torch.arange(
+                    0, (grid_count + 1) * num_visible, num_visible, device=self.gs_model.means.device, dtype=torch.long
+                )
+                world_pts = fvdb.JaggedTensor.from_data_and_offsets(repeated_data, offsets)
+
+                if self.model_config.use_grid_conv:
+                    conv_output = self.encoder_convnet(self.encoder_grids)
+                    visible_enc_feats = conv_output.sample_trilinear(world_pts)
+                else:
+                    with nvtx.range("encoder_gridbatch.sample_trilinear"):
+                        visible_enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
+
+                # visible_enc_feats.jdata is [grid_count * num_visible, F], reshape to [num_visible, grid_count * F]
+                num_features = visible_enc_feats.jdata.shape[-1]
+                visible_enc_feats = (
+                    visible_enc_feats.jdata.view(grid_count, num_visible, num_features)
+                    .permute(1, 0, 2)
+                    .reshape(num_visible, -1)
+                )
+
+                # Scatter into full tensor with zeros for non-visible gaussians
+                total_feature_dim = grid_count * num_features
+                enc_feats = torch.zeros(
+                    num_points, total_feature_dim, device=visible_enc_feats.device, dtype=visible_enc_feats.dtype
+                )
+                enc_feats[visible_ids] = visible_enc_feats
             else:
-                with nvtx.range("encoder_gridbatch.sample_trilinear"):
-                    enc_feats = self.encoder_gridbatch.sample_trilinear(world_pts, self.enc_features)
-            # enc_feats.jdata is [grid_count * N, F], we want [N, grid_count * F]
-            num_features = enc_feats.jdata.shape[-1]
-            enc_feats = (
-                enc_feats.jdata.view(grid_count, num_points, num_features).permute(1, 0, 2).reshape(num_points, -1)
-            )
+                # No visible gaussians - create zero tensor
+                num_features = self.model_config.grid_feature_dim
+                total_feature_dim = grid_count * num_features
+                enc_feats = torch.zeros(
+                    num_points, total_feature_dim, device=self.gs_model.means.device, dtype=torch.float32
+                )
 
             # Set them as the sh0 features
             enc_feats_state_dict = self.gs_model.state_dict()
