@@ -101,6 +101,12 @@ class LangSplatV2Dataset(SfmDataset):
                     sfm_item = super().__getitem__(idx)
                     self._images_cache[index] = sfm_item
 
+    def read_feature_data(self, index: int) -> dict[str, torch.Tensor]:
+        """Read feature data from disk cache."""
+        cache_filename = f"features_{index:0{self.num_zeropad}}"
+        _, data = self.sfm_scene.cache.read_file(cache_filename)
+        return data
+
     def _get_feature_data(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Load CLIP features and build GT feature map for an image.
 
@@ -115,9 +121,7 @@ class LangSplatV2Dataset(SfmDataset):
         if self._cache_features and index in self._features_cache:
             return self._features_cache[index]
 
-        # Read feature data from cache
-        cache_filename = f"features_{index:0{self.num_zeropad}}"
-        _, data = self.sfm_scene.cache.read_file(cache_filename)
+        data = self.read_feature_data(index)
 
         features = data["features"]  # [N_total, clip_n_dims]
         seg_maps = data["seg_maps"]  # [4, H, W]
