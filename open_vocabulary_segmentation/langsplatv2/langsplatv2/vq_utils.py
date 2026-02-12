@@ -128,8 +128,7 @@ class ResidualVectorQuantizationWithClustering(nn.Module):
 
 def load_clip_features_for_level(
     full_dataset: LangSplatV2Dataset,
-    feature_level: int,
-    device: torch.device | str = "cuda",
+    feature_level: int
 ) -> torch.Tensor:
     """Load CLIP features for a specific scale level.
 
@@ -139,7 +138,6 @@ def load_clip_features_for_level(
     Args:
         full_dataset: The full dataset containing all features.
         feature_level: Which scale level to load (0-3).
-        device: Device for the output tensor.
 
     Returns:
         Feature tensor of shape ``[N_level, clip_n_dims]`` containing
@@ -150,7 +148,6 @@ def load_clip_features_for_level(
     for image_id in range(len(full_dataset)):
         features, _, lengths = full_dataset.get_feature_data(image_id)
 
-        features = features.to(device)
         lengths = lengths.tolist()
 
         # Compute offset for the requested level

@@ -7,6 +7,7 @@ Manages the complete training pipeline including dataset creation, codebook
 initialization, optimization loop, checkpointing, and evaluation.
 """
 import logging
+import math
 import os
 import pathlib
 import random
@@ -108,6 +109,24 @@ class LangSplatV2Trainer:
             self._checkpoints_path = None
             self._metrics_file = None
 
+    def close(self) -> None:
+        """Flush and close the metrics log file.
+
+        Safe to call multiple times; subsequent calls are no-ops.
+        """
+        if self._metrics_file is not None and not self._metrics_file.closed:
+            self._metrics_file.flush()
+            self._metrics_file.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    def __enter__(self) -> "LangSplatV2Trainer":
+        return self
+
+    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object) -> None:
+        self.close()
+
     @property
     def model(self) -> LangSplatV2Model:
         """Get the LangSplatV2 model."""
@@ -131,7 +150,8 @@ class LangSplatV2Trainer:
     @property
     def total_steps(self) -> int:
         """Get the total number of steps for training."""
-        computed_total_steps: int = int(self._cfg.max_epochs * len(self._train_dataset))
+        steps_per_epoch = math.ceil(len(self._train_dataset) / self._cfg.batch_size)
+        computed_total_steps: int = self._cfg.max_epochs * steps_per_epoch
         total_steps: int = self._cfg.max_steps if self._cfg.max_steps is not None else computed_total_steps
         return total_steps
 
@@ -251,8 +271,7 @@ class LangSplatV2Trainer:
         )
         clip_features = load_clip_features_for_level(
             full_dataset=all_dataset,
-            feature_level=config.feature_level,
-            device=device,
+            feature_level=config.feature_level
         )
         logger.info(f"Loaded {clip_features.shape[0]:,} CLIP features of dimension {clip_features.shape[1]}")
 
@@ -488,8 +507,8 @@ class LangSplatV2Trainer:
         # Following LangSplatV2: layer_idx = min(step / 10000 * layer_num, layer_num - 1)
         layer_num = self._cfg.model.vq_layer_num
 
-        # Track epochs by samples processed, matching GARfVDB pattern
-        samples_per_epoch = len(self._train_dataset)
+        # Track epochs by optimizer steps, accounting for batch size
+        steps_per_epoch = math.ceil(len(self._train_dataset) / self._cfg.batch_size)
         prev_epoch = -1
 
         trainloader_iter = iter(trainloader)
@@ -584,8 +603,8 @@ class LangSplatV2Trainer:
 
             pbar.update(1)
 
-            # Calculate current epoch from samples processed
-            epoch = self._global_step // samples_per_epoch
+            # Calculate current epoch from steps processed
+            epoch = self._global_step // steps_per_epoch
 
             # Check for epoch boundary - run save/eval only once per epoch transition
             if epoch > prev_epoch:
@@ -620,6 +639,7 @@ class LangSplatV2Trainer:
             step += 1
 
         pbar.close()
+        self.close()
         self._logger.info("Training completed.")
 
     @torch.inference_mode()
@@ -680,6 +700,12 @@ class LangSplatV2Trainer:
         avg_loss = total_loss / max(num_batches, 1)
         self._logger.info(f"Evaluation loss: {avg_loss:.4f}")
         self._log_metric(self._global_step, "eval/loss", avg_loss)
+
+        # Flush metrics so eval results are not left in the write buffer.
+        # We intentionally flush (not close) because eval() is also called
+        # mid-training from train().
+        if self._metrics_file is not None and not self._metrics_file.closed:
+            self._metrics_file.flush()
 
         self._model.train()
         return avg_loss
