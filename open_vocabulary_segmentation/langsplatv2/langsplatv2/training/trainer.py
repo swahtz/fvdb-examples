@@ -30,6 +30,7 @@ from .dataset import (
     InfiniteSampler,
     LangSplatV2CollateFn,
     LangSplatV2Dataset,
+    build_feature_map,
 )
 
 logger = logging.getLogger(__name__)
@@ -493,9 +494,18 @@ class LangSplatV2Trainer:
             except StopIteration:
                 break
 
-            # Move to device
+            # Move compact data to device (features ~1MB + seg_map ~8MB,
+            # NOT the dense [H,W,512] feature map which would be ~4GB)
             with nvtx.range("data_to_device"):
                 minibatch = minibatch.to(self.device)
+
+            # Build dense feature map on GPU from compact data
+            with nvtx.range("build_feature_map"):
+                gt_features, feature_mask = build_feature_map(
+                    features=minibatch["features"],
+                    seg_map=minibatch["seg_map"],
+                    clip_n_dims=self._cfg.model.clip_n_dims,
+                )
 
             img_w = minibatch["image_w"][0]
             img_h = minibatch["image_h"][0]
@@ -520,8 +530,8 @@ class LangSplatV2Trainer:
             with nvtx.range("loss_computation"):
                 loss_dict = calculate_langsplatv2_loss(
                     predicted_features=predicted_features,
-                    gt_features=minibatch["gt_features"],
-                    mask=minibatch["feature_mask"],
+                    gt_features=gt_features,
+                    mask=feature_mask,
                     use_cosine_loss=self._cfg.use_cosine_loss,
                     use_l1_loss=self._cfg.use_l1_loss,
                     normalize_features=self._cfg.normalize_features,
@@ -622,6 +632,12 @@ class LangSplatV2Trainer:
         for val_batch in valloader:
             val_batch = val_batch.to(self.device)
 
+            gt_features, feature_mask = build_feature_map(
+                features=val_batch["features"],
+                seg_map=val_batch["seg_map"],
+                clip_n_dims=self._cfg.model.clip_n_dims,
+            )
+
             img_w = val_batch["image_w"][0]
             img_h = val_batch["image_h"][0]
 
@@ -634,8 +650,8 @@ class LangSplatV2Trainer:
 
             loss_dict = calculate_langsplatv2_loss(
                 predicted_features=predicted_features,
-                gt_features=val_batch["gt_features"],
-                mask=val_batch["feature_mask"],
+                gt_features=gt_features,
+                mask=feature_mask,
                 use_cosine_loss=self._cfg.use_cosine_loss,
                 use_l1_loss=self._cfg.use_l1_loss,
                 normalize_features=self._cfg.normalize_features,

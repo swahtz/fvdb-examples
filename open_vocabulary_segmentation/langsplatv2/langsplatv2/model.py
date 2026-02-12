@@ -10,6 +10,7 @@ from fvdb import GaussianSplat3d
 import torch.cuda.nvtx as nvtx
 
 from .util import rgb_to_sh
+from .vq_utils import softmax_to_topk_soft_code
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,6 @@ class LangSplatV2Model(nn.Module):
         codebook_size: int = 64,
         clip_n_dims: int = 512,
         topk: int = 4,
-        topk_refresh_every: int = 100,
         device: torch.device | str = "cuda",
     ):
         """Initialize the LangSplatV2 model.
@@ -58,9 +58,6 @@ class LangSplatV2Model(nn.Module):
             codebook_size: Number of entries per codebook.
             clip_n_dims: CLIP embedding dimensionality.
             topk: Number of non-zero sparse coefficients per layer.
-            topk_refresh_every: Recompute top-k indices every N steps.
-                Between refreshes only the softmax weights are recomputed,
-                avoiding the expensive topk kernel. Set to 1 to disable caching.
             device: Device for model parameters.
         """
         super().__init__()
@@ -70,7 +67,6 @@ class LangSplatV2Model(nn.Module):
         self.codebook_size = codebook_size
         self.clip_n_dims = clip_n_dims
         self.topk = topk
-        self.topk_refresh_every = topk_refresh_every
 
         self.gs_model = gs_model
         num_gaussians = gs_model.num_gaussians
@@ -90,12 +86,6 @@ class LangSplatV2Model(nn.Module):
             torch.randn(vq_layer_num, codebook_size, clip_n_dims, device=device) * 0.01
         )
 
-        # Cached top-k indices, refreshed every topk_refresh_every steps.
-        # Between refreshes, get_render_weights only does gather+softmax+scatter
-        # on [N, k] tensors instead of a full topk on [N, codebook_size].
-        self._cached_topk_idx: list[torch.Tensor] | None = None
-        self._topk_step: int = 0
-
         # Create a GaussianSplat3d for rendering sparse weights
         # We render the weight vectors as if they were sh0 color features
         self._gs_render = GaussianSplat3d.from_tensors(
@@ -110,62 +100,27 @@ class LangSplatV2Model(nn.Module):
         logger.info(
             f"LangSplatV2Model initialized: {num_gaussians:,} Gaussians, "
             f"{vq_layer_num} VQ layers, codebook_size={codebook_size}, "
-            f"topk={topk}, topk_refresh_every={topk_refresh_every}, "
-            f"clip_dims={clip_n_dims}"
+            f"topk={topk}, clip_dims={clip_n_dims}"
         )
-
-    def refresh_topk_indices(self) -> None:
-        """Recompute and cache the top-k indices from current logits.
-
-        Called automatically by :meth:`get_render_weights` when the cached
-        indices are stale, or can be called manually (e.g. before evaluation).
-        """
-        with torch.no_grad():
-            idx_list: list[torch.Tensor] = []
-            for i in range(self.vq_layer_num):
-                layer_logits = self.logits[:, i * self.codebook_size : (i + 1) * self.codebook_size]
-                _, layer_idx = torch.topk(layer_logits, self.topk, dim=1)  # [N, k]
-                idx_list.append(layer_idx)
-            self._cached_topk_idx = idx_list
-        self._topk_step = 0
 
     def get_render_weights(self) -> torch.Tensor:
         """Compute sparse coefficient weights from logits.
 
-        Uses cached top-k indices when available. The indices are refreshed
-        every ``topk_refresh_every`` steps (or always in eval mode). Between
-        refreshes, only ``gather`` + ``softmax`` + ``scatter`` on ``[N, k]``
-        tensors are needed, avoiding the expensive ``topk`` kernel.
+        For each VQ layer, selects the top-k logits, applies softmax over
+        just those k entries, then scatters into the full codebook-sized
+        output.
 
         Returns:
             Sparse weight tensor of shape ``[N, vq_layer_num * codebook_size]``.
         """
-        # Refresh indices when stale or in eval mode
-        needs_refresh = (
-            self._cached_topk_idx is None
-            or not self.training
-            or self._topk_step >= self.topk_refresh_every
-        )
-        if needs_refresh:
-            with nvtx.range("topk_refresh"):
-                self.refresh_topk_indices()
-        self._topk_step += 1
+        if self.vq_layer_num == 1:
+            return softmax_to_topk_soft_code(self.logits, self.topk)
 
-        # Cheap path: gather selected logits, softmax over k entries, scatter
-        weights_list: list[torch.Tensor] = []
+        weights_list = []
         for i in range(self.vq_layer_num):
             layer_logits = self.logits[:, i * self.codebook_size : (i + 1) * self.codebook_size]
-            layer_idx = self._cached_topk_idx[i]  # type: ignore[index]
-
-            selected = layer_logits.gather(1, layer_idx)  # [N, k]
-            sparse_weights = selected.softmax(dim=1)       # [N, k]
-
-            layer_result = torch.zeros_like(layer_logits)  # [N, codebook_size]
-            layer_result.scatter_(1, layer_idx, sparse_weights)
-            weights_list.append(layer_result)
-
-        if self.vq_layer_num == 1:
-            return weights_list[0]
+            sparse_weights = softmax_to_topk_soft_code(layer_logits, self.topk)
+            weights_list.append(sparse_weights)
         return torch.cat(weights_list, dim=-1)
 
     def render_weight_maps(
@@ -305,7 +260,6 @@ class LangSplatV2Model(nn.Module):
                 "codebook_size": self.codebook_size,
                 "clip_n_dims": self.clip_n_dims,
                 "topk": self.topk,
-                "topk_refresh_every": self.topk_refresh_every,
             },
         }
 
@@ -333,7 +287,6 @@ class LangSplatV2Model(nn.Module):
             codebook_size=config["codebook_size"],
             clip_n_dims=config["clip_n_dims"],
             topk=config["topk"],
-            topk_refresh_every=config.get("topk_refresh_every", 100),
             device=device,
         )
         model.load_state_dict(state["model_state"])
