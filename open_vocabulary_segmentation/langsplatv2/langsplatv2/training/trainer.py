@@ -287,6 +287,7 @@ class LangSplatV2Trainer:
             num_clusters=config.model.codebook_size,
             feature_dim=config.model.clip_n_dims,
             device=device,
+            seed=config.seed,
         )
         rvq.fit_quantizers(clip_features)
         initial_codebooks = torch.stack(rvq.quantizers, dim=0).to(device)

@@ -56,6 +56,7 @@ class ResidualVectorQuantizationWithClustering(nn.Module):
         num_levels: Number of quantization levels (layers).
         num_clusters: Number of cluster centers per level.
         feature_dim: Dimensionality of the codebook features.
+        seed: Random state passed to ``MiniBatchKMeans`` for reproducibility.
         quantizers: List of codebook tensors after fitting.
     """
 
@@ -65,6 +66,7 @@ class ResidualVectorQuantizationWithClustering(nn.Module):
         num_clusters: int,
         feature_dim: int,
         device: torch.device | str = "cuda",
+        seed: int = 42,
     ):
         """Initialize the residual VQ module.
 
@@ -73,12 +75,14 @@ class ResidualVectorQuantizationWithClustering(nn.Module):
             num_clusters: Number of clusters (codebook size) per level.
             feature_dim: Feature dimensionality.
             device: Device for codebook tensors.
+            seed: Random state for K-means clustering reproducibility.
         """
         super().__init__()
         self.num_levels = num_levels
         self.num_clusters = num_clusters
         self.feature_dim = feature_dim
         self.device = device
+        self.seed = seed
         self.quantizers: list[torch.Tensor] = []
 
     def fit_quantizers(self, features: torch.Tensor) -> None:
@@ -96,7 +100,7 @@ class ResidualVectorQuantizationWithClustering(nn.Module):
 
         for level in range(self.num_levels):
             logger.info(f"Fitting VQ level {level} with {self.num_clusters} clusters on {len(residuals)} samples")
-            kmeans = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=42)
+            kmeans = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=self.seed)
             kmeans.fit(residuals)
 
             # Store cluster centers as codebook
