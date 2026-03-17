@@ -3,9 +3,10 @@ channels:
   - conda-forge
   - nodefaults
 dependencies:
+  - cxx-compiler
   - blas=*=mkl
   - python=3.12
-  - pytorch-gpu=2.8.0
+  - pytorch-gpu=2.10.0
   - cuda-version=12.9
   - pip
   - git
@@ -16,6 +17,8 @@ dependencies:
   - tyro
   - scikit-learn
   - py-opencv
+  - open-clip-torch
+  - openusd
   - imageio
   - sam2
   - pyproj
@@ -32,3 +35,5 @@ dependencies:
   - rapidsai::cuml
   - cupy
   - matplotlib
+  - pip:
+    - dlnr_lite
