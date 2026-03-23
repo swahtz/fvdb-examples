@@ -245,11 +245,13 @@ class ViewCheckpoint:
     no_overlay: bool = False
     """Disable the segmentation overlay (show Gaussian splats only)."""
 
-    overlay_width: int = 1920
-    """Width of the segmentation overlay in pixels."""
+    overlay_width: int = 1440
+    """Width of the segmentation overlay in pixels.  Must match the
+    nanovdb-editor viewport width for correct alignment (default 1440)."""
 
-    overlay_height: int = 1080
-    """Height of the segmentation overlay in pixels."""
+    overlay_height: int = 720
+    """Height of the segmentation overlay in pixels.  Must match the
+    nanovdb-editor viewport height for correct alignment (default 720)."""
 
     overlay_downsample: int = 2
     """Downsample factor for rendering (renders at overlay_size/downsample)."""
@@ -338,11 +340,6 @@ class ViewCheckpoint:
                 image_sizes=image_sizes,
             )
 
-        # Get original training image size for projection scaling
-        assert image_sizes is not None
-        orig_img_w = int(image_sizes[0, 0].item())
-        orig_img_h = int(image_sizes[0, 1].item())
-
         # Compute render dimensions (smaller for performance)
         render_w = self.overlay_width // self.overlay_downsample
         render_h = self.overlay_height // self.overlay_downsample
@@ -377,11 +374,13 @@ class ViewCheckpoint:
         prev_direction = None
         prev_radius = None
         prev_up = None
+        prev_fov = None
 
         def camera_changed() -> bool:
             """Check if camera state changed using documented fvdb.viz.Scene properties."""
-            nonlocal prev_center, prev_direction, prev_radius, prev_up
+            nonlocal prev_center, prev_direction, prev_radius, prev_up, prev_fov
             try:
+                fov = viz_scene.camera_fov
                 center = viz_scene.camera_orbit_center.clone().cpu().numpy()
                 direction = viz_scene.camera_orbit_direction.clone().cpu().numpy()
                 radius = viz_scene.camera_orbit_radius
@@ -393,6 +392,7 @@ class ViewCheckpoint:
                     prev_direction = direction
                     prev_radius = radius
                     prev_up = up
+                    prev_fov = fov
                     return True
 
                 assert prev_center is not None and prev_direction is not None and prev_up is not None
@@ -401,6 +401,7 @@ class ViewCheckpoint:
                     or not np.allclose(direction, prev_direction)
                     or radius != prev_radius
                     or not np.allclose(up, prev_up)
+                    or fov != prev_fov
                 )
 
                 if changed:
@@ -408,23 +409,28 @@ class ViewCheckpoint:
                     prev_direction = direction
                     prev_radius = radius
                     prev_up = up
+                    prev_fov = fov
 
                 return changed
             except Exception:
                 return False
 
-        # Get reference projection from SfmScene and scale for render resolution
-        sfm_projection = torch.from_numpy(sfm_scene.projection_matrices).float()
-        orig_projection = sfm_projection[0]
-        # Scale the projection matrix from original training image size to render resolution
-        scale_x = render_w / orig_img_w
-        scale_y = render_h / orig_img_h
-        scaled_projection = orig_projection.clone()
-        scaled_projection[0, 0] *= scale_x  # fx
-        scaled_projection[1, 1] *= scale_y  # fy
-        scaled_projection[0, 2] *= scale_x  # cx
-        scaled_projection[1, 2] *= scale_y  # cy
-        reference_projection = scaled_projection.to(device)
+        # Build intrinsic matrix from the viewer's FOV to match its perspective
+        # camera.  Recomputed whenever the FOV changes.
+        cx = render_w / 2.0
+        cy = render_h / 2.0
+        cached_fov: float | None = None
+        reference_projection: torch.Tensor | None = None
+
+        def _update_projection(fov_y_rad: float) -> torch.Tensor:
+            nonlocal cached_fov, reference_projection
+            fy = render_h / (2.0 * np.tan(fov_y_rad / 2.0))
+            reference_projection = torch.tensor(
+                [[fy, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                dtype=torch.float32,
+            ).to(device)
+            cached_fov = fov_y_rad
+            return reference_projection
 
         # OpenGL to OpenCV conversion matrix (applied to camera axes)
         # OpenGL: X-right, Y-up, Z-backward
@@ -437,7 +443,10 @@ class ViewCheckpoint:
             if not overlay_enabled:
                 return
             try:
-                # Get orbit camera state from viewer
+                fov_y_rad = viz_scene.camera_fov
+                if reference_projection is None or fov_y_rad != cached_fov:
+                    _update_projection(fov_y_rad)
+
                 # NOTE: Despite the Python API name "camera_orbit_direction", the C++ implementation
                 # returns eye_direction which is the direction the camera is LOOKING (toward scene).
                 # Camera position = center - eye_direction * distance (see Camera.h line 387-390)
@@ -445,9 +454,6 @@ class ViewCheckpoint:
                 eye_direction = viz_scene.camera_orbit_direction.clone().cpu().numpy()
                 radius = viz_scene.camera_orbit_radius
                 up_world = viz_scene.camera_up_direction.clone().cpu().numpy()
-
-                # Camera position: center - eye_direction * radius
-                # (eye_direction points FROM camera TOWARD center)
                 position = center - eye_direction * radius
 
                 # Guard against degenerate camera states (zero-length vectors
@@ -490,6 +496,7 @@ class ViewCheckpoint:
                     return
 
                 # Render at lower resolution for performance
+                assert reference_projection is not None
                 rgba_image = renderer.render_segmentation_image(
                     camera_to_world, world_to_camera, reference_projection, render_w, render_h
                 )
