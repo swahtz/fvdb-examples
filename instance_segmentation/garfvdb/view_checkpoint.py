@@ -233,10 +233,10 @@ class ViewCheckpoint:
     device: str | torch.device = "cuda"
     """Device for computation (e.g., "cuda" or "cpu")."""
 
-    initial_scale: float = 0.1
+    mask_scale: float = 0.1
     """Initial segmentation scale as a fraction of max scale."""
 
-    initial_blend: float = 0.5
+    mask_blend: float = 0.5
     """Initial mask blend factor (0=beauty only, 1=mask only)."""
 
     camera_check_interval: float = 0.5
@@ -306,8 +306,8 @@ class ViewCheckpoint:
             segmentation_model=segmentation_model,
             device=device,
         )
-        renderer.scale = self.initial_scale * float(segmentation_model.max_grouping_scale.item())
-        renderer.mask_blend = self.initial_blend
+        renderer.scale = self.mask_scale * float(segmentation_model.max_grouping_scale.item())
+        renderer.mask_blend = self.mask_blend
 
         # Set initial camera position
         scene_centroid = gs_model.means.mean(dim=0).cpu().numpy()
