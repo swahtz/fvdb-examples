@@ -38,8 +38,8 @@ def main(
     visualize_every: int = -1,
     viewer_port: int = 8080,
     viewer_ip_address: str = "127.0.0.1",
-    overlay_width: int = 1920,
-    overlay_height: int = 1080,
+    overlay_width: int = 1440,
+    overlay_height: int = 720,
     overlay_downsample: int = 2,
     mask_scale: float = 0.1,
     mask_blend: float = 0.5,
@@ -74,8 +74,10 @@ def main(
         viewer_port (int): The port to expose the viewer server on if ``visualize_every > 0``.
         viewer_ip_address (str): The IP address to expose the viewer server on if
             ``visualize_every > 0``.
-        overlay_width (int): Width of the segmentation overlay in the viewer.
-        overlay_height (int): Height of the segmentation overlay in the viewer.
+        overlay_width (int): Width of the segmentation overlay in the viewer. Must match
+            the nanovdb-editor viewport width for correct alignment (default 1440).
+        overlay_height (int): Height of the segmentation overlay in the viewer. Must match
+            the nanovdb-editor viewport height for correct alignment (default 720).
         overlay_downsample (int): Downsample factor for rendering. Renders at
             ``overlay_size / overlay_downsample`` and then scales up for better performance.
         mask_scale (float): Fraction of scene max scale to use for rendering segmentation masks
@@ -91,6 +93,14 @@ def main(
     logger = logging.getLogger(__name__)
 
     viewer_enabled = visualize_every > 0
+    # ---- Initialize viewer BEFORE any CUDA operations ----
+    # The Vulkan device created by fviz.init() must be set up before the CUDA
+    # context is first created (by load_splats_from_file).  This matches the
+    # initialization order used in frgs reconstruction.
+    if viewer_enabled:
+        import fvdb.viz as fviz
+        fviz.init(ip_address=viewer_ip_address, port=viewer_port, verbose=verbose)
+
 
     # ---- Load data ----
     sfm_scene = load_sfm_scene(sfm_dataset_path, dataset_type)
@@ -119,7 +129,6 @@ def main(
     if viewer_enabled:
         import fvdb.viz as fviz
 
-        fviz.init(ip_address=viewer_ip_address, port=viewer_port, verbose=verbose)
         viz_scene = fviz.get_scene("Gaussian Splat Segmentation Training")
         viz_scene.add_gaussian_splat_3d("Gaussian Splats", gs_model)
 
@@ -164,24 +173,22 @@ def main(
     render_w = overlay_width // overlay_downsample
     render_h = overlay_height // overlay_downsample
 
-    # Get reference projection for intrinsics from metadata and scale for render resolution
-    projection_matrices = metadata.get("projection_matrices", None)
-    image_sizes = metadata.get("image_sizes", None)
-    reference_projection = None
-    if projection_matrices is not None and image_sizes is not None:
-        orig_projection = projection_matrices[0].float()
-        orig_w = float(image_sizes[0, 0].item())
-        orig_h = float(image_sizes[0, 1].item())
-        # Scale the projection matrix to the render resolution
-        # fx, fy scale with resolution, cx, cy scale with resolution
-        scale_x = render_w / orig_w
-        scale_y = render_h / orig_h
-        scaled_projection = orig_projection.clone()
-        scaled_projection[0, 0] *= scale_x  # fx
-        scaled_projection[1, 1] *= scale_y  # fy
-        scaled_projection[0, 2] *= scale_x  # cx
-        scaled_projection[1, 2] *= scale_y  # cy
-        reference_projection = scaled_projection.to(device)
+    # Build intrinsic matrix from the viewer's FOV to match its perspective
+    # camera.  Recomputed whenever the FOV changes.
+    cx = render_w / 2.0
+    cy = render_h / 2.0
+    cached_fov: float | None = None
+    reference_projection: torch.Tensor | None = None
+
+    def _update_projection(fov_y_rad: float) -> torch.Tensor:
+        nonlocal cached_fov, reference_projection
+        fy = render_h / (2.0 * np.tan(fov_y_rad / 2.0))
+        reference_projection = torch.tensor(
+            [[fy, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        ).to(device)
+        cached_fov = fov_y_rad
+        return reference_projection
 
     # OpenGL to OpenCV conversion matrix
     opengl_to_opencv = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
@@ -291,11 +298,14 @@ def main(
 
     def update_visualization(runner_arg: GaussianSplatScaleConditionedSegmentation, epoch: int) -> None:
         """Viz callback invoked at epoch boundaries to update the segmentation overlay."""
-        if image_view is None:
+        if image_view is None or viz_scene is None:
             return
         cam = get_viewer_camera()
         if cam is None:
             return
+        fov_y_rad = viz_scene.camera_fov
+        if reference_projection is None or fov_y_rad != cached_fov:
+            _update_projection(fov_y_rad)
         c2w = _camera_tuple_to_c2w(*cam)
         frame = render_overlay(runner_arg.model, c2w)
         if frame is not None:
@@ -315,6 +325,9 @@ def main(
             while True:
                 cam = get_viewer_camera()
                 if cam is not None:
+                    fov_y_rad = viz_scene.camera_fov
+                    if reference_projection is None or fov_y_rad != cached_fov:
+                        _update_projection(fov_y_rad)
                     c2w = _camera_tuple_to_c2w(*cam)
                     frame = render_overlay(runner.model, c2w)
                     if frame is not None and image_view is not None:
