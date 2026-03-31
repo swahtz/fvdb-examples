@@ -439,7 +439,7 @@ class ViewCheckpoint:
 
         def update_overlay() -> None:
             """Render segmentation and lazily create/update the image overlay."""
-            nonlocal image_view
+            nonlocal image_view, overlay_enabled
             if not overlay_enabled:
                 return
             try:
@@ -519,6 +519,7 @@ class ViewCheckpoint:
                         )
                     except Exception as e:
                         logger.warning(f"add_image API not available or failed: {e}")
+                        overlay_enabled = False
                         return
                 else:
                     image_view.update(flat_rgba)  # type: ignore[attr-defined]
