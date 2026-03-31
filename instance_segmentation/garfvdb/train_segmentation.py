@@ -143,8 +143,9 @@ def main(
                 height=overlay_height,
                 rgba_image=initial_image.flatten(),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Failed to create segmentation overlay image: {exc}")
+            logger.warning("Overlay visualization will be disabled for this session.")
 
         fviz.show()
         logger.info("=" * 60)
