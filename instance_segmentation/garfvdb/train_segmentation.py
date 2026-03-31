@@ -182,7 +182,7 @@ def main(
         eye_direction: np.ndarray,
         radius: float,
         up_world: np.ndarray,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         """Convert orbit camera parameters to a 4x4 camera-to-world matrix.
 
         Constructs a camera-to-world transformation matrix from the viewer's
@@ -190,21 +190,32 @@ def main(
         it from OpenGL to OpenCV convention for use with the segmentation model.
 
         Returns:
-            A 4x4 camera-to-world matrix in OpenCV convention on ``device``.
+            A 4x4 camera-to-world matrix in OpenCV convention on ``device``,
+            or ``None`` if the camera state is degenerate (zero-length or
+            near-parallel vectors).
         """
         # Camera position: center - eye_direction * radius
         position = center - eye_direction * radius
 
         # Forward = eye_direction (already the look direction)
-        forward = eye_direction / np.linalg.norm(eye_direction)
+        eye_norm = np.linalg.norm(eye_direction)
+        if eye_norm < 1e-8:
+            return None
+        forward = eye_direction / eye_norm
 
         # Right vector = forward x up_world
         right = np.cross(forward, up_world)
-        right = right / np.linalg.norm(right)
+        right_norm = np.linalg.norm(right)
+        if right_norm < 1e-8:
+            return None
+        right /= right_norm
 
         # Up vector = right x forward
         up = np.cross(right, forward)
-        up = up / np.linalg.norm(up)
+        up_norm = np.linalg.norm(up)
+        if up_norm < 1e-8:
+            return None
+        up /= up_norm
 
         # Build OpenGL-style camera-to-world (X-right, Y-up, Z-backward)
         c2w_gl = np.eye(4, dtype=np.float32)
@@ -294,6 +305,8 @@ def main(
         if reference_projection is None or fov_y_rad != cached_fov:
             _update_projection(fov_y_rad)
         c2w = _camera_tuple_to_c2w(*cam)
+        if c2w is None:
+            return
         frame = render_overlay(runner_arg.model, c2w)
         if frame is not None:
             image_view.update(frame.flatten())
@@ -330,6 +343,8 @@ def main(
                     if reference_projection is None or fov_y_rad != cached_fov:
                         _update_projection(fov_y_rad)
                     c2w = _camera_tuple_to_c2w(*cam)
+                    if c2w is None:
+                        continue
                     frame = render_overlay(runner.model, c2w)
                     if frame is not None and image_view is not None:
                         image_view.update(frame.flatten())
