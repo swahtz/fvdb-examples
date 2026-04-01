@@ -3,11 +3,12 @@ channels:
   - conda-forge
   - nodefaults
 dependencies:
+  - fvdb-core>=0.4.2,<0.5.0
   - cxx-compiler
   - blas=*=mkl
   - python=3.12
   - pytorch-gpu=2.10.0
-  - cuda-version=13.0
+  - cuda-version>=12.9
   - pip
   - git
   - gitpython
@@ -37,3 +38,4 @@ dependencies:
   - matplotlib
   - pip:
     - dlnr_lite
+    - nanovdb-editor>=0.0.24
