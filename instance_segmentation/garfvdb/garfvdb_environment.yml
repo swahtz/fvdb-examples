@@ -38,4 +38,5 @@ dependencies:
   - matplotlib
   - pip:
     - dlnr_lite
+    - fvdb-reality-capture>=0.4.0<0.5.0
     - nanovdb-editor>=0.0.24
